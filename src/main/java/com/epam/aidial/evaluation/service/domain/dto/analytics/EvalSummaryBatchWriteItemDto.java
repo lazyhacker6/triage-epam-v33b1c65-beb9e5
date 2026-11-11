@@ -1,0 +1,91 @@
+package com.epam.aidial.evaluation.service.domain.dto.analytics;
+
+import com.epam.aidial.evaluation.runner.model.ExecutionStatus;
+import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import java.util.UUID;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import tools.jackson.databind.JsonNode;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class EvalSummaryBatchWriteItemDto {
+
+    @Schema(
+            description = "Client-generated id for this row; when omitted, the service generates one. Set by "
+                    + "the in-process metric evaluation engine so the row's id is known before it is written, "
+                    + "letting a subsequent per-row score computation reference it without a re-query.",
+            example = "a10e8400-e29b-41d4-a716-446655440001")
+    private UUID id;
+
+    @NotNull(message = "testCaseRunResultId is required")
+    private UUID testCaseRunResultId;
+
+    @NotNull(message = "testCaseId is required")
+    private UUID testCaseId;
+
+    @NotBlank(message = "testCaseName is required")
+    @Size(max = 255, message = "testCaseName must be less than 255 characters")
+    private String testCaseName;
+
+    @NotNull(message = "runIndex is required")
+    @Min(value = 0, message = "runIndex must be >= 0")
+    @Max(value = 99999, message = "runIndex must be <= 99999")
+    private Integer runIndex;
+
+    @Schema(
+            description = "0-based position within a suite's request chain; defaults to 0 (single-request) "
+                    + "when omitted.",
+            example = "0")
+    @Min(value = 0, message = "requestIndex must be >= 0")
+    private Integer requestIndex;
+
+    @Schema(description = "Chain length (request count); defaults to 1 (single-request) when omitted.", example = "1")
+    @Min(value = 1, message = "totalRequests must be >= 1")
+    private Integer totalRequests;
+
+    @Schema(
+            description = "0-based turn position within a multi-turn test case; defaults to 0 (single-turn) "
+                    + "when omitted.",
+            example = "0")
+    @Min(value = 0, message = "turnIndex must be >= 0")
+    private Integer turnIndex;
+
+    @Schema(
+            description = "Planned turn count of the test case; defaults to 1 (single-turn) when omitted.",
+            example = "1")
+    @Min(value = 1, message = "totalTurns must be >= 1")
+    private Integer totalTurns;
+
+    @NotNull(message = "testCaseData is required")
+    private JsonNode testCaseData;
+
+    private JsonNode extractedColumns;
+
+    @NotNull(message = "executionStatus is required")
+    private ExecutionStatus executionStatus;
+
+    @NotNull(message = "execDurationMs is required")
+    private Long execDurationMs;
+
+    @NotNull(message = "metricEvalDurationMs is required")
+    private Long metricEvalDurationMs;
+
+    private Integer responseStatusCode;
+
+    @NotNull(message = "metricValues is required")
+    private JsonNode metricValues;
+
+    private JsonNode metricInfos;
+
+    private JsonNode extractionWarnings;
+}

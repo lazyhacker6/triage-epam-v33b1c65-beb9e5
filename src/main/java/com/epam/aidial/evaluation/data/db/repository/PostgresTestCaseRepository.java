@@ -1,0 +1,635 @@
+package com.epam.aidial.evaluation.data.db.repository;
+
+import static com.epam.aidial.evaluation.data.db.jooq.meta.Tables.TEST_CASES;
+
+import com.epam.aidial.evaluation.data.db.mapper.TestCaseRecordMapper;
+import com.epam.aidial.evaluation.data.db.model.TestCase;
+import com.epam.aidial.evaluation.data.db.model.filter.FilterCondition;
+import com.epam.aidial.evaluation.data.db.model.pagination.Page;
+import com.epam.aidial.evaluation.data.db.model.pagination.PageRequest;
+import com.epam.aidial.evaluation.data.db.repository.sql.BulkPatchFields;
+import com.epam.aidial.evaluation.data.db.repository.sql.FilterWhitelists;
+import com.epam.aidial.evaluation.data.db.repository.sql.OrderByBuilder;
+import com.epam.aidial.evaluation.data.db.repository.sql.PageRequestSqlBuilder;
+import com.epam.aidial.evaluation.data.db.repository.sql.SortWhitelists;
+import com.epam.aidial.evaluation.data.db.repository.sql.WhereBuilder;
+import com.epam.aidial.evaluation.data.db.transaction.timestamp.TransactionTimestampContext;
+import com.epam.aidial.evaluation.runner.config.logging.LogExecution;
+import java.time.Clock;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import lombok.RequiredArgsConstructor;
+import org.jooq.Condition;
+import org.jooq.DSLContext;
+import org.jooq.Field;
+import org.jooq.JSONB;
+import org.jooq.Query;
+import org.jooq.SortField;
+import org.jooq.impl.DSL;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.stereotype.Repository;
+
+@Repository
+@LogExecution
+@RequiredArgsConstructor
+@ConditionalOnProperty(name = "datasource.meta.vendor", havingValue = "POSTGRES")
+public class PostgresTestCaseRepository implements TestCaseRepository {
+
+    private static final String PARKED_NAME_PREFIX = "__tc_batch_";
+
+    @Qualifier("metaDsl")
+    private final DSLContext dsl;
+
+    private final TestCaseRecordMapper recordMapper;
+    private final WhereBuilder whereBuilder;
+    private final OrderByBuilder orderByBuilder;
+    private final TransactionTimestampContext transactionTimestampContext;
+    private final Clock clock;
+
+    @Override
+    public Page<TestCase> findAllByDatasetId(
+            UUID datasetId, PageRequest pageRequest, List<FilterCondition> filters, boolean includeTotalCount) {
+        Condition filterCondition =
+                whereBuilder.build(filters != null ? filters : List.of(), FilterWhitelists.TEST_CASES);
+        Condition combined = DSL.and(TEST_CASES.DATASET_ID.eq(datasetId.toString()), filterCondition);
+
+        long totalCount = includeTotalCount ? countByCondition(combined) : -1;
+        List<SortField<?>> orderBy = orderByBuilder.build(pageRequest.getSort(), SortWhitelists.TEST_CASES);
+
+        int limit = PageRequestSqlBuilder.limit(pageRequest);
+        long offset = PageRequestSqlBuilder.offset(pageRequest);
+
+        List<TestCase> content = dsl.selectFrom(TEST_CASES)
+                .where(combined)
+                .orderBy(orderBy)
+                .limit(limit)
+                .offset(offset)
+                .fetch(recordMapper::map);
+
+        return includeTotalCount ? Page.of(content, pageRequest, totalCount) : Page.withoutTotal(content, pageRequest);
+    }
+
+    private long countByCondition(Condition condition) {
+        Long count = dsl.selectCount().from(TEST_CASES).where(condition).fetchOne(0, Long.class);
+        return count != null ? count : 0L;
+    }
+
+    @Override
+    public Optional<TestCase> findByIdAndDatasetId(UUID id, UUID datasetId) {
+        return dsl.selectFrom(TEST_CASES)
+                .where(TEST_CASES.ID.eq(id.toString()).and(TEST_CASES.DATASET_ID.eq(datasetId.toString())))
+                .fetchOptional(recordMapper::map);
+    }
+
+    @Override
+    public TestCase save(TestCase testCase) {
+        long now = transactionTimestampContext.getTimestamp();
+        if (testCase.getId() == null) {
+            testCase.setId(UUID.randomUUID());
+        }
+        testCase.setCreatedAt(now);
+        testCase.setUpdatedAt(now);
+
+        dsl.insertInto(TEST_CASES)
+                .set(TEST_CASES.ID, testCase.getId().toString())
+                .set(TEST_CASES.DATASET_ID, testCase.getDatasetId().toString())
+                .set(TEST_CASES.TEST_CASE_NAME, testCase.getTestCaseName())
+                .set(TEST_CASES.DATA, toJsonb(testCase.getData()))
+                .set(TEST_CASES.MULTI_TURN_DATA, toJsonb(testCase.getMultiTurnData()))
+                .set(TEST_CASES.IS_VALID, testCase.isValid())
+                .set(
+                        TEST_CASES.VALIDATION_WARNINGS,
+                        toJsonb(testCase.getValidationWarnings() != null ? testCase.getValidationWarnings() : "[]"))
+                .set(TEST_CASES.CREATED_AT_MS, testCase.getCreatedAt())
+                .set(TEST_CASES.UPDATED_AT_MS, testCase.getUpdatedAt())
+                .execute();
+        return testCase;
+    }
+
+    @Override
+    public TestCase update(TestCase testCase) {
+        long now = transactionTimestampContext.getTimestamp();
+        testCase.setUpdatedAt(now);
+
+        int updated = dsl.update(TEST_CASES)
+                .set(TEST_CASES.TEST_CASE_NAME, testCase.getTestCaseName())
+                .set(TEST_CASES.DATA, toJsonb(testCase.getData()))
+                .set(TEST_CASES.MULTI_TURN_DATA, toJsonb(testCase.getMultiTurnData()))
+                .set(TEST_CASES.IS_VALID, testCase.isValid())
+                .set(
+                        TEST_CASES.VALIDATION_WARNINGS,
+                        toJsonb(testCase.getValidationWarnings() != null ? testCase.getValidationWarnings() : "[]"))
+                .set(TEST_CASES.UPDATED_AT_MS, now)
+                .where(TEST_CASES
+                        .ID
+                        .eq(testCase.getId().toString())
+                        .and(TEST_CASES.DATASET_ID.eq(testCase.getDatasetId().toString())))
+                .execute();
+        return updated == 0 ? null : testCase;
+    }
+
+    @Override
+    public List<TestCase> findAllByIdsAndDatasetId(Collection<UUID> ids, UUID datasetId) {
+        if (ids == null || ids.isEmpty()) {
+            return List.of();
+        }
+        List<String> idStrings = ids.stream().map(UUID::toString).toList();
+        return dsl.selectFrom(TEST_CASES)
+                .where(TEST_CASES.ID.in(idStrings).and(TEST_CASES.DATASET_ID.eq(datasetId.toString())))
+                .fetch(recordMapper::map);
+    }
+
+    @Override
+    public void batchUpdate(List<TestCase> testCases) {
+        if (testCases == null || testCases.isEmpty()) {
+            return;
+        }
+        // Phase 1: park every row's name at a unique temporary value so a name permutation within the
+        // batch (swap/cycle) does not violate the non-deferrable unique index on an intermediate state.
+        parkTestCaseNames(testCases);
+
+        // Phase 2: apply the final name and other fields.
+        long now = transactionTimestampContext.getTimestamp();
+        List<Query> queries = testCases.stream()
+                .map(tc -> {
+                    tc.setUpdatedAt(now);
+                    return (Query) dsl.update(TEST_CASES)
+                            .set(TEST_CASES.TEST_CASE_NAME, tc.getTestCaseName())
+                            .set(TEST_CASES.DATA, toJsonb(tc.getData()))
+                            .set(TEST_CASES.MULTI_TURN_DATA, toJsonb(tc.getMultiTurnData()))
+                            .set(TEST_CASES.IS_VALID, tc.isValid())
+                            .set(
+                                    TEST_CASES.VALIDATION_WARNINGS,
+                                    toJsonb(tc.getValidationWarnings() != null ? tc.getValidationWarnings() : "[]"))
+                            .set(TEST_CASES.UPDATED_AT_MS, now)
+                            .where(TEST_CASES
+                                    .ID
+                                    .eq(tc.getId().toString())
+                                    .and(TEST_CASES.DATASET_ID.eq(
+                                            tc.getDatasetId().toString())));
+                })
+                .toList();
+        dsl.batch(queries).execute();
+    }
+
+    @Override
+    public void parkTestCaseNames(List<TestCase> testCases) {
+        if (testCases == null || testCases.isEmpty()) {
+            return;
+        }
+        final String token = UUID.randomUUID().toString().replace("-", "");
+        List<Query> queries = testCases.stream()
+                .map(tc -> (Query) dsl.update(TEST_CASES)
+                        .set(TEST_CASES.TEST_CASE_NAME, parkedName(token, tc.getId()))
+                        .where(TEST_CASES
+                                .ID
+                                .eq(tc.getId().toString())
+                                .and(TEST_CASES.DATASET_ID.eq(tc.getDatasetId().toString()))))
+                .toList();
+        dsl.batch(queries).execute();
+    }
+
+    private static String parkedName(String token, UUID id) {
+        return PARKED_NAME_PREFIX + token + "_" + id;
+    }
+
+    @Override
+    public List<String> findCollidingNamesByDatasetIdExcludingIds(
+            UUID datasetId, Collection<UUID> excludeIds, Collection<String> lowercasedNames) {
+        if (lowercasedNames == null || lowercasedNames.isEmpty()) {
+            return List.of();
+        }
+        List<String> excludeIdStrings = excludeIds.stream().map(UUID::toString).toList();
+        return dsl.select(DSL.lower(TEST_CASES.TEST_CASE_NAME))
+                .from(TEST_CASES)
+                .where(TEST_CASES
+                        .DATASET_ID
+                        .eq(datasetId.toString())
+                        .and(TEST_CASES.ID.notIn(excludeIdStrings))
+                        .and(DSL.lower(TEST_CASES.TEST_CASE_NAME).in(lowercasedNames)))
+                .fetch(0, String.class);
+    }
+
+    @Override
+    public boolean deleteByIdAndDatasetId(UUID id, UUID datasetId) {
+        int deleted = dsl.deleteFrom(TEST_CASES)
+                .where(TEST_CASES.ID.eq(id.toString()).and(TEST_CASES.DATASET_ID.eq(datasetId.toString())))
+                .execute();
+        return deleted > 0;
+    }
+
+    @Override
+    public long deleteAllByDatasetId(UUID datasetId, List<FilterCondition> filters) {
+        if (filters == null || filters.isEmpty()) {
+            return dsl.deleteFrom(TEST_CASES)
+                    .where(TEST_CASES.DATASET_ID.eq(datasetId.toString()))
+                    .execute();
+        }
+        Condition filterCondition = whereBuilder.build(filters, FilterWhitelists.TEST_CASES);
+        Condition combined = DSL.and(TEST_CASES.DATASET_ID.eq(datasetId.toString()), filterCondition);
+        return dsl.delete(TEST_CASES).where(combined).execute();
+    }
+
+    @Override
+    public boolean existsMultiTurnByDatasetId(UUID datasetId) {
+        return dsl.fetchExists(dsl.selectOne()
+                .from(TEST_CASES)
+                .where(TEST_CASES.DATASET_ID.eq(datasetId.toString()).and(TEST_CASES.MULTI_TURN_DATA.isNotNull())));
+    }
+
+    @Override
+    public long countByDatasetId(UUID datasetId) {
+        Long count = dsl.selectCount()
+                .from(TEST_CASES)
+                .where(TEST_CASES.DATASET_ID.eq(datasetId.toString()))
+                .fetchOne(0, Long.class);
+        return count != null ? count : 0L;
+    }
+
+    @Override
+    public List<TestCase> findBatchByDatasetId(UUID datasetId, int offset, int limit) {
+        return dsl.selectFrom(TEST_CASES)
+                .where(TEST_CASES.DATASET_ID.eq(datasetId.toString()))
+                .orderBy(TEST_CASES.CREATED_AT_MS.asc(), TEST_CASES.ID.asc())
+                .limit(limit)
+                .offset(offset)
+                .fetch(recordMapper::map);
+    }
+
+    @Override
+    public void updateValidation(UUID id, UUID datasetId, boolean valid, String validationWarningsJson) {
+        dsl.update(TEST_CASES)
+                .set(TEST_CASES.IS_VALID, valid)
+                .set(
+                        TEST_CASES.VALIDATION_WARNINGS,
+                        toJsonb(validationWarningsJson != null ? validationWarningsJson : "[]"))
+                .set(TEST_CASES.UPDATED_AT_MS, clock.millis())
+                .where(TEST_CASES.ID.eq(id.toString()).and(TEST_CASES.DATASET_ID.eq(datasetId.toString())))
+                .execute();
+    }
+
+    @Override
+    public int updateDataIfUnchanged(
+            UUID id, UUID datasetId, String dataJson, long expectedUpdatedAt, long newUpdatedAt) {
+        return dsl.update(TEST_CASES)
+                .set(TEST_CASES.DATA, toJsonb(dataJson != null ? dataJson : "{}"))
+                .set(TEST_CASES.UPDATED_AT_MS, newUpdatedAt)
+                .where(TEST_CASES
+                        .ID
+                        .eq(id.toString())
+                        .and(TEST_CASES.DATASET_ID.eq(datasetId.toString()))
+                        .and(TEST_CASES.UPDATED_AT_MS.eq(expectedUpdatedAt)))
+                .execute();
+    }
+
+    @Override
+    public int updateDataAndTurnsIfUnchanged(
+            UUID id,
+            UUID datasetId,
+            String dataJson,
+            String multiTurnDataJson,
+            long expectedUpdatedAt,
+            long newUpdatedAt) {
+        return dsl.update(TEST_CASES)
+                .set(TEST_CASES.DATA, toJsonb(dataJson != null ? dataJson : "{}"))
+                .set(TEST_CASES.MULTI_TURN_DATA, toJsonb(multiTurnDataJson))
+                .set(TEST_CASES.UPDATED_AT_MS, newUpdatedAt)
+                .where(TEST_CASES
+                        .ID
+                        .eq(id.toString())
+                        .and(TEST_CASES.DATASET_ID.eq(datasetId.toString()))
+                        .and(TEST_CASES.UPDATED_AT_MS.eq(expectedUpdatedAt)))
+                .execute();
+    }
+
+    @Override
+    public int updateValidationIfUnchanged(
+            UUID id, UUID datasetId, boolean isValid, String warningsJson, long expectedUpdatedAt, long newUpdatedAt) {
+        return dsl.update(TEST_CASES)
+                .set(TEST_CASES.IS_VALID, isValid)
+                .set(TEST_CASES.VALIDATION_WARNINGS, toJsonb(warningsJson != null ? warningsJson : "[]"))
+                .set(TEST_CASES.UPDATED_AT_MS, newUpdatedAt)
+                .where(TEST_CASES
+                        .ID
+                        .eq(id.toString())
+                        .and(TEST_CASES.DATASET_ID.eq(datasetId.toString()))
+                        .and(TEST_CASES.UPDATED_AT_MS.eq(expectedUpdatedAt)))
+                .execute();
+    }
+
+    @Override
+    public List<TestCase> findValidByDatasetId(UUID datasetId, int offset, int limit) {
+        return findValidByDatasetIdMatching(datasetId, null, offset, limit);
+    }
+
+    @Override
+    public List<TestCase> findValidByDatasetIdMatching(
+            UUID datasetId, Condition extraCondition, int offset, int limit) {
+        Condition combined = withExtra(validCondition(datasetId), extraCondition);
+        return dsl.selectFrom(TEST_CASES)
+                .where(combined)
+                .orderBy(TEST_CASES.CREATED_AT_MS.asc(), TEST_CASES.ID.asc())
+                .limit(limit)
+                .offset(offset)
+                .fetch(recordMapper::map);
+    }
+
+    @Override
+    public long countValidByDatasetId(UUID datasetId) {
+        return countValidByDatasetIdMatching(datasetId, null);
+    }
+
+    @Override
+    public long countValidByDatasetIdMatching(UUID datasetId, Condition extraCondition) {
+        Long count = dsl.selectCount()
+                .from(TEST_CASES)
+                .where(withExtra(validCondition(datasetId), extraCondition))
+                .fetchOne(0, Long.class);
+        return count != null ? count : 0L;
+    }
+
+    private static Condition withExtra(Condition base, Condition extraCondition) {
+        return extraCondition == null ? base : base.and(extraCondition);
+    }
+
+    /** Builds the snapshot-phase predicate {@code dataset_id = ? AND is_valid = TRUE}. */
+    private static Condition validCondition(UUID datasetId) {
+        return TEST_CASES.DATASET_ID.eq(datasetId.toString()).and(TEST_CASES.IS_VALID.eq(true));
+    }
+
+    @Override
+    public int insertOrSkip(TestCase testCase) {
+        long now = transactionTimestampContext.getTimestamp();
+        if (testCase.getId() == null) {
+            testCase.setId(UUID.randomUUID());
+        }
+        testCase.setCreatedAt(now);
+        testCase.setUpdatedAt(now);
+        return dsl.insertInto(TEST_CASES)
+                .set(TEST_CASES.ID, testCase.getId().toString())
+                .set(TEST_CASES.DATASET_ID, testCase.getDatasetId().toString())
+                .set(TEST_CASES.TEST_CASE_NAME, testCase.getTestCaseName())
+                .set(TEST_CASES.DATA, toJsonb(testCase.getData()))
+                .set(TEST_CASES.MULTI_TURN_DATA, toJsonb(testCase.getMultiTurnData()))
+                .set(TEST_CASES.IS_VALID, testCase.isValid())
+                .set(
+                        TEST_CASES.VALIDATION_WARNINGS,
+                        toJsonb(testCase.getValidationWarnings() != null ? testCase.getValidationWarnings() : "[]"))
+                .set(TEST_CASES.CREATED_AT_MS, testCase.getCreatedAt())
+                .set(TEST_CASES.UPDATED_AT_MS, testCase.getUpdatedAt())
+                .onConflict(DSL.field("dataset_id"), DSL.field("LOWER(test_case_name)"))
+                .doNothing()
+                .execute();
+    }
+
+    @Override
+    public boolean insertOrOverride(TestCase testCase) {
+        long now = transactionTimestampContext.getTimestamp();
+        if (testCase.getId() == null) {
+            testCase.setId(UUID.randomUUID());
+        }
+        testCase.setCreatedAt(now);
+        testCase.setUpdatedAt(now);
+        // RETURNING (xmax <> 0)::int requires plain SQL; jOOQ's onConflictDoUpdate does not
+        // expose an expression-based RETURNING clause for custom expressions like xmax.
+        Integer wasUpdate = dsl.resultQuery(
+                        "INSERT INTO test_cases ("
+                                + "id, dataset_id, test_case_name, data, multi_turn_data, is_valid, validation_warnings, "
+                                + "created_at_ms, updated_at_ms"
+                                + ") VALUES ("
+                                + "{0}, {1}, {2}, {3}::jsonb, {4}::jsonb, {5}, {6}::jsonb, {7}, {8}"
+                                + ") ON CONFLICT (dataset_id, LOWER(test_case_name)) DO UPDATE SET"
+                                + " test_case_name = EXCLUDED.test_case_name,"
+                                + " data = EXCLUDED.data,"
+                                + " multi_turn_data = EXCLUDED.multi_turn_data,"
+                                + " is_valid = EXCLUDED.is_valid,"
+                                + " validation_warnings = EXCLUDED.validation_warnings,"
+                                + " updated_at_ms = EXCLUDED.updated_at_ms"
+                                + " RETURNING (xmax <> 0)::int AS was_update",
+                        DSL.val(testCase.getId().toString()),
+                        DSL.val(testCase.getDatasetId().toString()),
+                        DSL.val(testCase.getTestCaseName()),
+                        DSL.val(testCase.getData() != null ? testCase.getData() : "{}"),
+                        DSL.val(testCase.getMultiTurnData()),
+                        DSL.val(testCase.isValid()),
+                        DSL.val(testCase.getValidationWarnings() != null ? testCase.getValidationWarnings() : "[]"),
+                        DSL.val(testCase.getCreatedAt()),
+                        DSL.val(testCase.getUpdatedAt()))
+                .fetchOne(0, Integer.class);
+        return wasUpdate != null && wasUpdate == 1;
+    }
+
+    @Override
+    public void removeDataFields(UUID datasetId, Collection<String> fieldNames) {
+        if (fieldNames == null || fieldNames.isEmpty()) {
+            return;
+        }
+        // jOOQ has no typed DSL for the JSONB - text[] operator. Bind the field names as
+        // an ARRAY[?, ?, ...] expression where every element is a parameter, not an inlined literal.
+        // multi_turn_data is pruned element-wise, but only when it is genuinely a JSONB array of
+        // objects — the sole shape the operation is defined for. Every other shape (SQL NULL, the
+        // JSONB scalar `null`, a scalar/non-array value, or an array containing a non-object element)
+        // is passed through byte-identical rather than touched:
+        //   - `IS NOT NULL` alone is not sufficient — the JSONB scalar `null` also satisfies it, and
+        //     jsonb_array_elements() on a scalar raises "cannot extract elements from a scalar",
+        //     failing the whole UPDATE. jsonb_typeof(...) = 'array' is the real guard.
+        //   - An empty array must stay `[]`, not collapse to SQL NULL: jsonb_agg() over zero rows
+        //     returns NULL, which would silently convert a multi-turn case to single-turn (the exact
+        //     data loss design D6 exists to prevent) — COALESCE back to '[]'::jsonb.
+        //   - A non-object element (e.g. a corrupted turn array holding scalars) is passed through
+        //     unchanged rather than having keys "subtracted" from it — `elem - text[]` on a scalar
+        //     raises "cannot delete from scalar", so the per-element CASE only applies `-` to objects.
+        Field<String[]> fieldsArray = DSL.array(fieldNames.toArray(String[]::new));
+        dsl.execute(
+                "UPDATE test_cases SET "
+                        + "data = data - {0}::text[], "
+                        + "multi_turn_data = CASE WHEN jsonb_typeof(multi_turn_data) = 'array' THEN "
+                        + "(SELECT COALESCE(jsonb_agg(CASE WHEN jsonb_typeof(elem) = 'object' "
+                        + "THEN elem - {0}::text[] ELSE elem END ORDER BY ord), '[]'::jsonb) "
+                        + "FROM jsonb_array_elements(multi_turn_data) WITH ORDINALITY AS t(elem, ord)) "
+                        + "ELSE multi_turn_data END "
+                        + "WHERE dataset_id = {1}",
+                fieldsArray, DSL.val(datasetId.toString()));
+    }
+
+    @Override
+    public int renameDataFields(UUID datasetId, Map<String, String> renames) {
+        if (renames == null || renames.isEmpty()) {
+            return 0;
+        }
+        // Parallel bound text[] arrays (old keys / new keys); names are never inlined. The jsonb `?` / `?|`
+        // operators collide with JDBC placeholders, so the equivalent jsonb_exists / jsonb_exists_any functions
+        // are used. Every new key is read from the ORIGINAL object, so swaps and chains are simultaneous.
+        // Aliases (m, src, dst, e, elem, t, ord) do not shadow the column expressions `data` / `elem`.
+        // multi_turn_data is rewritten only when it is a JSONB array, and only its object elements; every other
+        // shape is passed through untouched (same guard as removeDataFields). The UPDATE only touches rows that
+        // hold at least one old key. updated_at_ms is deliberately not bumped (matches removeDataFields).
+        final List<String> oldKeys = new ArrayList<>(renames.keySet());
+        final List<String> newKeys = oldKeys.stream().map(renames::get).toList();
+        final Field<String[]> oldArray = DSL.array(oldKeys.toArray(String[]::new));
+        final Field<String[]> newArray = DSL.array(newKeys.toArray(String[]::new));
+        final String dataRename = renameExpression("data", "{0}", "{1}");
+        final String turnRename = renameExpression("t.elem", "{0}", "{1}");
+        return dsl.execute(
+                "UPDATE test_cases SET "
+                        + "data = CASE WHEN jsonb_typeof(data) = 'object' THEN " + dataRename + " ELSE data END, "
+                        + "multi_turn_data = CASE WHEN jsonb_typeof(multi_turn_data) = 'array' THEN "
+                        + "(SELECT COALESCE(jsonb_agg(CASE WHEN jsonb_typeof(t.elem) = 'object' "
+                        + "THEN " + turnRename + " ELSE t.elem END ORDER BY t.ord), '[]'::jsonb) "
+                        + "FROM jsonb_array_elements(multi_turn_data) WITH ORDINALITY AS t(elem, ord)) "
+                        + "ELSE multi_turn_data END "
+                        + "WHERE dataset_id = {2} AND ("
+                        + "(jsonb_typeof(data) = 'object' AND jsonb_exists_any(data, {0}::text[])) "
+                        + "OR (jsonb_typeof(multi_turn_data) = 'array' AND EXISTS ("
+                        + "SELECT 1 FROM jsonb_array_elements(multi_turn_data) AS e(elem) "
+                        + "WHERE jsonb_typeof(e.elem) = 'object' AND jsonb_exists_any(e.elem, {0}::text[]))))",
+                oldArray,
+                newArray,
+                DSL.val(datasetId.toString()));
+    }
+
+    private static String renameExpression(String column, String oldArg, String newArg) {
+        return "((" + column + " - " + oldArg + "::text[]) || COALESCE((SELECT jsonb_object_agg(m.dst, "
+                + column + " -> m.src) FROM unnest(" + oldArg + "::text[], " + newArg
+                + "::text[]) AS m(src, dst) WHERE jsonb_exists(" + column + ", m.src)), '{}'::jsonb))";
+    }
+
+    @Override
+    public List<String> findExistingNamesByDatasetIdAndNamesLower(UUID datasetId, List<String> lowerNames) {
+        if (lowerNames == null || lowerNames.isEmpty()) {
+            return List.of();
+        }
+        return dsl.select(TEST_CASES.TEST_CASE_NAME)
+                .from(TEST_CASES)
+                .where(TEST_CASES
+                        .DATASET_ID
+                        .eq(datasetId.toString())
+                        .and(DSL.lower(TEST_CASES.TEST_CASE_NAME).in(lowerNames)))
+                .fetch(TEST_CASES.TEST_CASE_NAME);
+    }
+
+    @Override
+    public void batchInsert(List<TestCase> testCases, long timestamp) {
+        if (testCases == null || testCases.isEmpty()) {
+            return;
+        }
+        List<Query> queries = testCases.stream()
+                .map(tc -> (Query) dsl.insertInto(TEST_CASES)
+                        .set(TEST_CASES.ID, tc.getId().toString())
+                        .set(TEST_CASES.DATASET_ID, tc.getDatasetId().toString())
+                        .set(TEST_CASES.TEST_CASE_NAME, tc.getTestCaseName())
+                        .set(TEST_CASES.DATA, toJsonb(tc.getData()))
+                        .set(TEST_CASES.MULTI_TURN_DATA, toJsonb(tc.getMultiTurnData()))
+                        .set(TEST_CASES.IS_VALID, tc.isValid())
+                        .set(
+                                TEST_CASES.VALIDATION_WARNINGS,
+                                toJsonb(tc.getValidationWarnings() != null ? tc.getValidationWarnings() : "[]"))
+                        .set(TEST_CASES.CREATED_AT_MS, tc.getCreatedAt() != null ? tc.getCreatedAt() : timestamp)
+                        .set(TEST_CASES.UPDATED_AT_MS, timestamp))
+                .toList();
+        dsl.batch(queries).execute();
+    }
+
+    @Override
+    public int updateFieldsByIds(UUID datasetId, List<UUID> ids, Map<String, Object> setClause, long updatedAtMs) {
+        if (ids == null || ids.isEmpty() || setClause == null || setClause.isEmpty()) {
+            return 0;
+        }
+
+        var update = dsl.update(TEST_CASES);
+        var step = update.set(TEST_CASES.UPDATED_AT_MS, updatedAtMs);
+        Condition distinct = null;
+        for (Map.Entry<String, Object> entry : setClause.entrySet()) {
+            String column = BulkPatchFields.columnFor(entry.getKey());
+            if (column == null) {
+                throw new IllegalArgumentException("Field '" + entry.getKey() + "' is not in the bulk-patch whitelist");
+            }
+            switch (entry.getKey()) {
+                case "testCaseName" -> {
+                    String value =
+                            entry.getValue() == null ? null : entry.getValue().toString();
+                    step = step.set(TEST_CASES.TEST_CASE_NAME, value);
+                    Condition c = TEST_CASES.TEST_CASE_NAME.isDistinctFrom(value);
+                    distinct = distinct == null ? c : distinct.or(c);
+                }
+                case "data" -> {
+                    JSONB jsonb = toJsonb((String) entry.getValue());
+                    step = step.set(TEST_CASES.DATA, jsonb);
+                    Condition c = TEST_CASES.DATA.isDistinctFrom(jsonb);
+                    distinct = distinct == null ? c : distinct.or(c);
+                }
+                default ->
+                    throw new IllegalArgumentException(
+                            "Field '" + entry.getKey() + "' is whitelisted but unhandled by repository");
+            }
+        }
+
+        List<String> idStrings = ids.stream().map(UUID::toString).toList();
+        Condition where = TEST_CASES.DATASET_ID.eq(datasetId.toString()).and(TEST_CASES.ID.in(idStrings));
+        if (distinct != null) {
+            where = where.and(distinct);
+        }
+        return step.where(where).execute();
+    }
+
+    @Override
+    public List<UUID> findIdsByDatasetIdAndFilter(UUID datasetId, List<FilterCondition> filters, int limit) {
+        Condition filterCondition =
+                whereBuilder.build(filters != null ? filters : List.of(), FilterWhitelists.TEST_CASES);
+        Condition combined = DSL.and(TEST_CASES.DATASET_ID.eq(datasetId.toString()), filterCondition);
+
+        List<String> idStrings = dsl.select(TEST_CASES.ID)
+                .from(TEST_CASES)
+                .where(combined)
+                .limit(limit)
+                .fetch(TEST_CASES.ID);
+        List<UUID> result = new ArrayList<>(idStrings.size());
+        for (String s : idStrings) {
+            result.add(UUID.fromString(s));
+        }
+        return result;
+    }
+
+    @Override
+    public List<UUID> findExistingIdsInDataset(UUID datasetId, List<UUID> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return List.of();
+        }
+        List<String> idStrings = ids.stream().map(UUID::toString).toList();
+        List<String> rows = dsl.select(TEST_CASES.ID)
+                .from(TEST_CASES)
+                .where(TEST_CASES.DATASET_ID.eq(datasetId.toString()).and(TEST_CASES.ID.in(idStrings)))
+                .fetch(TEST_CASES.ID);
+        List<UUID> result = new ArrayList<>(rows.size());
+        for (String s : rows) {
+            result.add(UUID.fromString(s));
+        }
+        return result;
+    }
+
+    @Override
+    public List<UUID> deleteByIdsAndDatasetId(UUID datasetId, List<UUID> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return List.of();
+        }
+        List<String> idStrings = ids.stream().map(UUID::toString).toList();
+        List<String> deletedIdStrings = dsl.deleteFrom(TEST_CASES)
+                .where(TEST_CASES.DATASET_ID.eq(datasetId.toString()).and(TEST_CASES.ID.in(idStrings)))
+                .returningResult(TEST_CASES.ID)
+                .fetch(TEST_CASES.ID);
+        List<UUID> result = new ArrayList<>(deletedIdStrings.size());
+        for (String s : deletedIdStrings) {
+            result.add(UUID.fromString(s));
+        }
+        return result;
+    }
+
+    private static JSONB toJsonb(String json) {
+        return json != null ? JSONB.valueOf(json) : null;
+    }
+}

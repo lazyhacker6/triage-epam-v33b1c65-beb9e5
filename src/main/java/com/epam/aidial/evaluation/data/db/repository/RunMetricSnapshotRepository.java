@@ -1,0 +1,17 @@
+package com.epam.aidial.evaluation.data.db.repository;
+
+import com.epam.aidial.evaluation.data.db.model.RunMetricSnapshot;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+
+public interface RunMetricSnapshotRepository {
+
+    void saveAll(List<RunMetricSnapshot> snapshots);
+
+    List<RunMetricSnapshot> findByRunId(UUID runId);
+
+    List<RunMetricSnapshot> findByRunIdAndComputationId(UUID runId, UUID computationId);
+
+    Optional<UUID> findLatestComputationId(UUID runId);
+}

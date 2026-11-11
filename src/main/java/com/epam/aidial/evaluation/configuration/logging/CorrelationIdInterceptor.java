@@ -1,0 +1,81 @@
+package com.epam.aidial.evaluation.configuration.logging;
+
+import com.epam.aidial.evaluation.constants.SecurityConstants;
+import com.epam.aidial.evaluation.utils.TraceContextUtils;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.util.regex.Pattern;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.RandomStringUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.text.StringEscapeUtils;
+import org.jetbrains.annotations.NotNull;
+import org.jspecify.annotations.Nullable;
+import org.slf4j.MDC;
+import org.springframework.web.servlet.AsyncHandlerInterceptor;
+
+@Slf4j
+public class CorrelationIdInterceptor implements AsyncHandlerInterceptor {
+    private static final Pattern CORRELATION_ID_PATTERN = Pattern.compile("^[a-zA-Z0-9]{"
+            + SecurityConstants.CORRELATION_ID_MIN_LENGTH + "," + SecurityConstants.CORRELATION_ID_MAX_LENGTH + "}$");
+    private static final int CORRELATION_ID_LENGTH = SecurityConstants.CORRELATION_ID_MIN_LENGTH;
+
+    @Override
+    public boolean preHandle(
+            @NotNull final HttpServletRequest request,
+            final HttpServletResponse response,
+            @NotNull final Object handler) {
+        response.setHeader(SecurityConstants.CORRELATION_ID_HEADER_NAME, resolveValidCorrelationId(request));
+        return true;
+    }
+
+    @Override
+    public void afterCompletion(
+            @NotNull final HttpServletRequest request,
+            @NotNull final HttpServletResponse response,
+            @NotNull final Object handler,
+            @Nullable final Exception ex) {
+        MDC.remove(SecurityConstants.CORRELATION_ID_MDC_KEY);
+    }
+
+    @Override
+    public void afterConcurrentHandlingStarted(
+            HttpServletRequest request, HttpServletResponse response, Object handler) {
+        MDC.remove(SecurityConstants.CORRELATION_ID_MDC_KEY);
+    }
+
+    private String resolveValidCorrelationId(final HttpServletRequest request) {
+        var correlationId = request.getHeader(SecurityConstants.CORRELATION_ID_HEADER_NAME);
+        var validCorrelationId = (correlationId != null
+                        && CORRELATION_ID_PATTERN.matcher(correlationId).matches())
+                ? correlationId
+                : generateCorrelationId();
+
+        MDC.put(SecurityConstants.CORRELATION_ID_MDC_KEY, validCorrelationId);
+
+        if (!validCorrelationId.equals(correlationId)) {
+            var uri = request.getRequestURI();
+            var message = "Correlation ID '" + StringEscapeUtils.escapeJava(correlationId)
+                    + "' isn't valid, generated correlationId='" + validCorrelationId + "', url='" + uri + "'";
+            if (StringUtils.isBlank(correlationId)) {
+                log.debug(message);
+            } else {
+                log.error(message);
+            }
+        }
+
+        return validCorrelationId;
+    }
+
+    public static String generateCorrelationId() {
+        String traceId = TraceContextUtils.getTraceId();
+        if (traceId == null) {
+            return generateRandomCorrelationId();
+        }
+        return traceId;
+    }
+
+    private static String generateRandomCorrelationId() {
+        return RandomStringUtils.secure().nextAlphanumeric(CORRELATION_ID_LENGTH);
+    }
+}

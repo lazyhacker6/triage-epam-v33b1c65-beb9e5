@@ -1,0 +1,682 @@
+package com.epam.aidial.evaluation.service.domain;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyChar;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import com.epam.aidial.evaluation.client.dialcore.DialRouteTriggerClient;
+import com.epam.aidial.evaluation.client.dialcore.DialRouteTriggerException;
+import com.epam.aidial.evaluation.configuration.properties.dialapp.DialAppProperties;
+import com.epam.aidial.evaluation.configuration.properties.testsuite.TestSuiteRunProperties;
+import com.epam.aidial.evaluation.constants.SecurityConstants;
+import com.epam.aidial.evaluation.data.db.model.RunStatus;
+import com.epam.aidial.evaluation.data.db.model.TestSuite;
+import com.epam.aidial.evaluation.data.db.model.TestSuiteRun;
+import com.epam.aidial.evaluation.data.db.repository.TestSuiteRepository;
+import com.epam.aidial.evaluation.data.db.repository.TestSuiteRunRepository;
+import com.epam.aidial.evaluation.query.service.QueryDslRunnableTestCaseSelector;
+import com.epam.aidial.evaluation.runner.dto.TestSuiteRunResponseDto;
+import com.epam.aidial.evaluation.runner.model.ExecutionStatus;
+import com.epam.aidial.evaluation.runner.model.TestCaseRunResult;
+import com.epam.aidial.evaluation.runner.util.AuthorizationTokenHolder;
+import com.epam.aidial.evaluation.runner.util.CallerCredential;
+import com.epam.aidial.evaluation.runner.util.RunnerJsonbMapper;
+import com.epam.aidial.evaluation.service.domain.analytics.EvalResultsCsvParser;
+import com.epam.aidial.evaluation.service.domain.analytics.EvalResultsImportService;
+import com.epam.aidial.evaluation.service.domain.analytics.RunDeletionService;
+import com.epam.aidial.evaluation.service.domain.exception.DatasetVisibilityRuleException;
+import com.epam.aidial.evaluation.service.domain.exception.EntityNotFoundException;
+import com.epam.aidial.evaluation.service.domain.exception.InvalidOperationException;
+import com.epam.aidial.evaluation.service.domain.filter.FilterParser;
+import com.epam.aidial.evaluation.service.domain.job.ActiveRunRegistry;
+import com.epam.aidial.evaluation.service.domain.job.ExecutionSettingsValidator;
+import com.epam.aidial.evaluation.service.domain.job.TestSuiteEvaluationJob;
+import com.epam.aidial.evaluation.service.domain.mapper.JsonbMapper;
+import com.epam.aidial.evaluation.service.domain.mapper.TestSuiteRunMapper;
+import com.epam.aidial.evaluation.service.domain.sort.SortParser;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanContext;
+import io.opentelemetry.api.trace.TraceFlags;
+import io.opentelemetry.api.trace.TraceState;
+import io.opentelemetry.context.Scope;
+import java.io.ByteArrayInputStream;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.slf4j.MDC;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import tools.jackson.databind.ObjectMapper;
+
+@DisplayName("TestSuiteRunService.importResultsAndEvaluate")
+@ExtendWith(MockitoExtension.class)
+class TestSuiteRunServiceTest {
+
+    @Mock
+    private TestSuiteRunRepository testSuiteRunRepository;
+
+    @Mock
+    private TestSuiteRepository testSuiteRepository;
+
+    @Mock
+    private TestCaseService testCaseService;
+
+    @Mock
+    private QueryDslRunnableTestCaseSelector runnableTestCaseSelector;
+
+    @Mock
+    private TestSuiteEvaluationJob evaluationJob;
+
+    @Mock
+    private ActiveRunRegistry registry;
+
+    @Mock
+    private ExecutionSettingsValidator executionSettingsValidator;
+
+    @Mock
+    private TestSuiteRunSseService sseService;
+
+    @Mock
+    private TestSuiteRunMapper mapper;
+
+    @Mock
+    private FilterParser filterParser;
+
+    @Mock
+    private SortParser sortParser;
+
+    @Mock
+    private EvalResultsImportService evalResultsImportService;
+
+    @Mock
+    private EvalResultsCsvParser evalResultsCsvParser;
+
+    @Mock
+    private RunDeletionService runDeletionService;
+
+    @Mock
+    private DialRouteTriggerClient dialRouteTriggerClient;
+
+    @Mock
+    private DialAppProperties dialAppProperties;
+
+    @Mock
+    private PlatformTransactionManager metaTransactionManager;
+
+    private TestSuiteRunService service;
+    private UUID testSuiteId;
+    private UUID datasetId;
+
+    @BeforeEach
+    void setUp() {
+        TestSuiteRunProperties.Limits limits = new TestSuiteRunProperties.Limits();
+        limits.setMaxConcurrentRunsGlobal(100);
+        limits.setMaxConcurrentRunsPerSuite(100);
+        TestSuiteRunProperties properties = new TestSuiteRunProperties();
+        properties.setLimits(limits);
+
+        service = new TestSuiteRunService(
+                testSuiteRunRepository,
+                testSuiteRepository,
+                testCaseService,
+                new SuiteTargetResolver(new JsonbMapper(new ObjectMapper(), new RunnerJsonbMapper(new ObjectMapper()))),
+                runnableTestCaseSelector,
+                properties,
+                evaluationJob,
+                registry,
+                executionSettingsValidator,
+                sseService,
+                mapper,
+                filterParser,
+                sortParser,
+                new ObjectMapper(),
+                evalResultsImportService,
+                evalResultsCsvParser,
+                Optional.of(dialRouteTriggerClient),
+                Optional.of(dialAppProperties),
+                runDeletionService,
+                metaTransactionManager);
+
+        testSuiteId = UUID.randomUUID();
+        datasetId = UUID.randomUUID();
+    }
+
+    @AfterEach
+    void tearDown() {
+        MDC.remove(SecurityConstants.CORRELATION_ID_MDC_KEY);
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+        AuthorizationTokenHolder.clearToken();
+    }
+
+    private TestSuite validBoundSuite() {
+        return TestSuite.builder()
+                .id(testSuiteId)
+                .datasetId(datasetId)
+                .valid(true)
+                .responseColumns("[]")
+                .build();
+    }
+
+    /** Minimal CSV stream — content not important since parsing is mocked via {@code evalResultsCsvParser}. */
+    private InputStream emptyCsvStream() {
+        return new ByteArrayInputStream("testCaseName,runIndex\n".getBytes(StandardCharsets.UTF_8));
+    }
+
+    private List<TestCaseRunResult> oneItem(String testCaseName) {
+        return List.of(TestCaseRunResult.builder()
+                .testCaseName(testCaseName)
+                .testCaseId(java.util.UUID.randomUUID())
+                .runIndex(0)
+                .testCaseData("{}")
+                .executionStatus(ExecutionStatus.SUCCESS)
+                .execStartedAtMs(1000L)
+                .execCompletedAtMs(1500L)
+                .build());
+    }
+
+    @Nested
+    @DisplayName("guards")
+    class Guards {
+
+        @Test
+        @DisplayName("throws EntityNotFoundException when suite does not exist")
+        void throwsWhenSuiteNotFound() {
+            when(testSuiteRepository.findById(testSuiteId)).thenReturn(Optional.empty());
+
+            assertThatThrownBy(() -> service.importResultsAndEvaluate(testSuiteId, null, emptyCsvStream(), 0L, ','))
+                    .isInstanceOf(EntityNotFoundException.class);
+        }
+
+        @Test
+        @DisplayName("throws DatasetVisibilityRuleException when suite has no dataset")
+        void throwsWhenSuiteUnbound() {
+            TestSuite suite = TestSuite.builder()
+                    .id(testSuiteId)
+                    .datasetId(null)
+                    .valid(true)
+                    .build();
+            when(testSuiteRepository.findById(testSuiteId)).thenReturn(Optional.of(suite));
+
+            assertThatThrownBy(() -> service.importResultsAndEvaluate(testSuiteId, null, emptyCsvStream(), 0L, ','))
+                    .isInstanceOf(DatasetVisibilityRuleException.class);
+        }
+
+        @Test
+        @DisplayName("throws InvalidOperationException when suite is not valid")
+        void throwsWhenSuiteInvalid() {
+            TestSuite suite = TestSuite.builder()
+                    .id(testSuiteId)
+                    .datasetId(datasetId)
+                    .valid(false)
+                    .build();
+            when(testSuiteRepository.findById(testSuiteId)).thenReturn(Optional.of(suite));
+
+            assertThatThrownBy(() -> service.importResultsAndEvaluate(testSuiteId, null, emptyCsvStream(), 0L, ','))
+                    .isInstanceOf(InvalidOperationException.class);
+        }
+    }
+
+    @Nested
+    @DisplayName("afterCommit dispatch")
+    class AfterCommitDispatch {
+
+        @BeforeEach
+        void setUpResolvableSuite() {
+            when(testSuiteRepository.findById(testSuiteId)).thenReturn(Optional.of(validBoundSuite()));
+            when(evalResultsCsvParser.parse(eq(datasetId), any(InputStream.class), anyLong(), anyChar()))
+                    .thenReturn(oneItem("tc1"));
+            when(testSuiteRunRepository.nextRunNameSequenceValue()).thenReturn(1L);
+            when(testSuiteRunRepository.save(any(TestSuiteRun.class))).thenAnswer(invocation -> {
+                TestSuiteRun run = invocation.getArgument(0);
+                run.setId(UUID.randomUUID());
+                return run;
+            });
+            when(mapper.toDto(any(TestSuiteRun.class)))
+                    .thenReturn(TestSuiteRunResponseDto.builder().build());
+        }
+
+        private void invokeAndFireAfterCommit() {
+            TransactionSynchronizationManager.initSynchronization();
+            service.importResultsAndEvaluate(testSuiteId, null, emptyCsvStream(), 0L, ',');
+            for (TransactionSynchronization sync : TransactionSynchronizationManager.getSynchronizations()) {
+                sync.afterCommit();
+            }
+        }
+
+        @Test
+        @DisplayName("dispatches Phase 2+3 evaluation when result persistence succeeds, passing parsed items through")
+        void dispatchesEvaluationOnSuccess() {
+            invokeAndFireAfterCommit();
+
+            @SuppressWarnings("unchecked")
+            ArgumentCaptor<List<TestCaseRunResult>> itemsCaptor = ArgumentCaptor.forClass(List.class);
+            verify(evalResultsImportService)
+                    .persistResults(eq(testSuiteId), any(TestSuiteRun.class), itemsCaptor.capture());
+            assertThat(itemsCaptor.getValue()).hasSize(1);
+            assertThat(itemsCaptor.getValue().get(0).getTestCaseName()).isEqualTo("tc1");
+
+            verify(evaluationJob).dispatch(any(UUID.class), isNull(), eq(true));
+            verify(testSuiteRunRepository, never()).updateToFailed(any(), any(), any(), anyLong(), anyLong());
+        }
+
+        @Test
+        @DisplayName("marks the run FAILED and never dispatches evaluation when result persistence fails")
+        void marksRunFailedWhenPersistenceFails() {
+            doThrow(new RuntimeException("analytics write failed"))
+                    .when(evalResultsImportService)
+                    .persistResults(eq(testSuiteId), any(TestSuiteRun.class), any());
+            when(testSuiteRunRepository.findById(any(UUID.class)))
+                    .thenReturn(Optional.of(
+                            TestSuiteRun.builder().id(UUID.randomUUID()).build()));
+
+            invokeAndFireAfterCommit();
+
+            verify(testSuiteRunRepository)
+                    .updateToFailed(
+                            any(UUID.class),
+                            eq("Failed to persist imported eval results"),
+                            any(),
+                            anyLong(),
+                            anyLong());
+            verify(sseService).notifyStatusUpdate(any(TestSuiteRun.class));
+            verify(evaluationJob, never()).dispatch(any(), any(), anyBoolean());
+        }
+
+        @Test
+        @DisplayName("shouldCountCancellingAsActive_forConcurrencyLimits")
+        void shouldCountCancellingAsActive_forConcurrencyLimits() {
+            TransactionSynchronizationManager.initSynchronization();
+            service.importResultsAndEvaluate(testSuiteId, null, emptyCsvStream(), 0L, ',');
+
+            @SuppressWarnings("unchecked")
+            ArgumentCaptor<List<String>> globalStatusesCaptor = ArgumentCaptor.forClass(List.class);
+            verify(testSuiteRunRepository).countByStatuses(globalStatusesCaptor.capture());
+            assertThat(globalStatusesCaptor.getValue()).contains(RunStatus.CANCELLING.name());
+
+            @SuppressWarnings("unchecked")
+            ArgumentCaptor<List<String>> suiteStatusesCaptor = ArgumentCaptor.forClass(List.class);
+            verify(testSuiteRunRepository)
+                    .countByTestSuiteIdAndStatuses(eq(testSuiteId), suiteStatusesCaptor.capture());
+            assertThat(suiteStatusesCaptor.getValue()).contains(RunStatus.CANCELLING.name());
+        }
+    }
+
+    @Nested
+    @DisplayName("dispatchEvaluation branching")
+    class DispatchEvaluationBranching {
+
+        private final UUID runId = UUID.randomUUID();
+
+        @Test
+        @DisplayName("calls DialRouteTriggerClient when dial-app-proxy.enabled=true and credential is not null")
+        void callsDialRouteTriggerClientWhenEnabled() throws InterruptedException {
+            when(dialAppProperties.isEnabled()).thenReturn(true);
+            CallerCredential credential = CallerCredential.bearer("jwt-token");
+
+            CountDownLatch latch = new CountDownLatch(1);
+            doAnswer(invocation -> {
+                        latch.countDown();
+                        return null;
+                    })
+                    .when(dialRouteTriggerClient)
+                    .triggerEvalRun(any(UUID.class), any(CallerCredential.class));
+
+            invokeDispatchEvaluation(runId, credential, false);
+
+            // Wait for virtual thread to complete
+            assertThat(latch.await(2, TimeUnit.SECONDS)).isTrue();
+            verify(dialRouteTriggerClient).triggerEvalRun(runId, credential);
+            verify(evaluationJob, never()).dispatch(any(), any(), anyBoolean());
+        }
+
+        @Test
+        @DisplayName(
+                "propagates the caller's OpenTelemetry context and correlation ID to the DialRouteTriggerClient virtual thread")
+        void propagatesTraceContextToRouteTriggerThread() throws InterruptedException {
+            when(dialAppProperties.isEnabled()).thenReturn(true);
+            CallerCredential credential = CallerCredential.bearer("jwt-token");
+            SpanContext callerSpanContext = SpanContext.create(
+                    "0af7651916cd43dd8448eb211c80319c",
+                    "b7ad6b7169203331",
+                    TraceFlags.getSampled(),
+                    TraceState.getDefault());
+
+            AtomicReference<SpanContext> observed = new AtomicReference<>();
+            AtomicReference<String> observedCorrelation = new AtomicReference<>();
+            CountDownLatch latch = new CountDownLatch(1);
+            doAnswer(invocation -> {
+                        observed.set(Span.current().getSpanContext());
+                        observedCorrelation.set(MDC.get(SecurityConstants.CORRELATION_ID_MDC_KEY));
+                        latch.countDown();
+                        return null;
+                    })
+                    .when(dialRouteTriggerClient)
+                    .triggerEvalRun(any(UUID.class), any(CallerCredential.class));
+
+            MDC.put(SecurityConstants.CORRELATION_ID_MDC_KEY, "callerCorrelation123");
+            try (Scope ignored = Span.wrap(callerSpanContext).makeCurrent()) {
+                invokeDispatchEvaluation(runId, credential, false);
+            }
+
+            assertThat(latch.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThat(observed.get()).isEqualTo(callerSpanContext);
+            assertThat(observedCorrelation.get()).isEqualTo("callerCorrelation123");
+        }
+
+        @Test
+        @DisplayName("marks the run FAILED when DialRouteTriggerClient throws DialRouteTriggerException")
+        void marksRunFailedWhenRouteTriggerThrows() {
+            when(dialAppProperties.isEnabled()).thenReturn(true);
+            CallerCredential credential = CallerCredential.bearer("jwt-token");
+
+            doThrow(new DialRouteTriggerException("boom", new RuntimeException("cause")))
+                    .when(dialRouteTriggerClient)
+                    .triggerEvalRun(any(UUID.class), any(CallerCredential.class));
+            when(evaluationJob.buildErrorDetails(eq("DIAL_APP_ROUTE_TRIGGER_FAILED"), any(), anyString(), isNull()))
+                    .thenReturn("{}");
+
+            invokeDispatchEvaluation(runId, credential, false);
+
+            // The mark-failed call happens on the virtual thread after triggerEvalRun throws, so this
+            // must poll rather than rely on a latch counted down before the throw.
+            verify(testSuiteRunRepository, timeout(2000))
+                    .updateToFailed(eq(runId), anyString(), anyString(), anyLong(), anyLong());
+        }
+
+        @Test
+        @DisplayName(
+                "fails a route-trigger-failed run with one timestamp so the repository sets startedAt == completedAt")
+        void routeTriggerFailureUsesSingleTimestampForCompletedAndUpdated() {
+            when(dialAppProperties.isEnabled()).thenReturn(true);
+            doThrow(new DialRouteTriggerException("boom", new RuntimeException("cause")))
+                    .when(dialRouteTriggerClient)
+                    .triggerEvalRun(any(UUID.class), any(CallerCredential.class));
+            when(evaluationJob.buildErrorDetails(eq("DIAL_APP_ROUTE_TRIGGER_FAILED"), any(), anyString(), isNull()))
+                    .thenReturn("{}");
+
+            invokeDispatchEvaluation(runId, CallerCredential.bearer("jwt-token"), false);
+
+            ArgumentCaptor<Long> completedAt = ArgumentCaptor.forClass(Long.class);
+            ArgumentCaptor<Long> updatedAt = ArgumentCaptor.forClass(Long.class);
+            verify(testSuiteRunRepository, timeout(2000))
+                    .updateToFailed(eq(runId), anyString(), anyString(), completedAt.capture(), updatedAt.capture());
+            assertThat(completedAt.getValue()).isEqualTo(updatedAt.getValue());
+        }
+
+        @Test
+        @DisplayName("calls TestSuiteEvaluationJob when dial-app-proxy.enabled=false")
+        void callsJobDispatchWhenDisabled() {
+            when(dialAppProperties.isEnabled()).thenReturn(false);
+            CallerCredential credential = CallerCredential.bearer("jwt-token");
+
+            invokeDispatchEvaluation(runId, credential, false);
+
+            verify(evaluationJob).dispatch(runId, credential, false);
+            verify(dialRouteTriggerClient, never()).triggerEvalRun(any(), any());
+        }
+
+        @Test
+        @DisplayName("calls TestSuiteEvaluationJob when credential is null even if flag is enabled")
+        void callsJobWhenCredentialNullDespiteEnabled() {
+            when(dialAppProperties.isEnabled()).thenReturn(true);
+
+            invokeDispatchEvaluation(runId, null, false);
+
+            verify(evaluationJob).dispatch(runId, null, false);
+            verify(dialRouteTriggerClient, never()).triggerEvalRun(any(), any());
+        }
+
+        private void invokeDispatchEvaluation(UUID runId, CallerCredential credential, boolean skipDeploymentPhase) {
+            try {
+                var method = TestSuiteRunService.class.getDeclaredMethod(
+                        "dispatchEvaluation", UUID.class, CallerCredential.class, boolean.class, Runnable.class);
+                method.setAccessible(true);
+                method.invoke(service, runId, credential, skipDeploymentPhase, (Runnable) () -> {});
+            } catch (ReflectiveOperationException ex) {
+                throw new RuntimeException(ex);
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("cancelRun")
+    class CancelRun {
+
+        private final UUID runId = UUID.randomUUID();
+
+        private TestSuiteRun runWithStatus(String status) {
+            return TestSuiteRun.builder().id(runId).status(status).build();
+        }
+
+        @Test
+        @DisplayName("throws InvalidOperationException for a terminal run and never touches the registry")
+        void throwsInvalidOperation_whenTerminal() {
+            when(testSuiteRunRepository.findById(runId))
+                    .thenReturn(Optional.of(runWithStatus(RunStatus.COMPLETED.name())));
+
+            assertThatThrownBy(() -> service.cancelRun(runId)).isInstanceOf(InvalidOperationException.class);
+
+            verify(registry, never()).cancel(any());
+            verify(sseService, never()).notifyStatusUpdate(any());
+        }
+
+        @Test
+        @DisplayName("shouldReturnCurrentDto_whenAlreadyCancelling")
+        void shouldReturnCurrentDto_whenAlreadyCancelling() {
+            TestSuiteRun run = runWithStatus(RunStatus.CANCELLING.name());
+            when(testSuiteRunRepository.findById(runId)).thenReturn(Optional.of(run));
+            TestSuiteRunResponseDto dto = TestSuiteRunResponseDto.builder().build();
+            when(mapper.toDto(run)).thenReturn(dto);
+
+            TestSuiteRunResponseDto result = service.cancelRun(runId);
+
+            assertThat(result).isSameAs(dto);
+            verify(testSuiteRunRepository, never()).updateStatusOptimistic(any(), any(), any());
+            verify(testSuiteRunRepository, never()).markCancelling(any());
+            verify(registry, never()).cancel(any());
+            verify(sseService, never()).notifyStatusUpdate(any());
+        }
+
+        @Test
+        @DisplayName("cancels a PENDING run optimistically without calling markCancelling")
+        void cancelsPendingRunOptimistically() {
+            TestSuiteRun pending = runWithStatus(RunStatus.PENDING.name());
+            TestSuiteRun cancelled = runWithStatus(RunStatus.CANCELLED.name());
+            when(testSuiteRunRepository.findById(runId))
+                    .thenReturn(Optional.of(pending))
+                    .thenReturn(Optional.of(cancelled));
+            when(testSuiteRunRepository.updateStatusOptimistic(
+                            runId, RunStatus.CANCELLED.name(), RunStatus.PENDING.name()))
+                    .thenReturn(1);
+            TestSuiteRunResponseDto dto = TestSuiteRunResponseDto.builder().build();
+            when(mapper.toDto(cancelled)).thenReturn(dto);
+
+            TransactionSynchronizationManager.initSynchronization();
+            TestSuiteRunResponseDto result = service.cancelRun(runId);
+            for (TransactionSynchronization sync : TransactionSynchronizationManager.getSynchronizations()) {
+                sync.afterCommit();
+            }
+
+            assertThat(result).isSameAs(dto);
+            verify(sseService).notifyStatusUpdate(cancelled);
+            verify(testSuiteRunRepository, never()).markCancelling(any());
+            verify(registry).cancel(runId);
+        }
+
+        @Test
+        @DisplayName("shouldMarkCancellingAndCancelHandleAfterCommit_whenRunning")
+        void shouldMarkCancellingAndCancelHandleAfterCommit_whenRunning() {
+            TestSuiteRun running = runWithStatus(RunStatus.RUNNING.name());
+            TestSuiteRun cancelling = runWithStatus(RunStatus.CANCELLING.name());
+            when(testSuiteRunRepository.findById(runId))
+                    .thenReturn(Optional.of(running))
+                    .thenReturn(Optional.of(cancelling));
+            when(testSuiteRunRepository.markCancelling(runId)).thenReturn(1);
+            TestSuiteRunResponseDto dto = TestSuiteRunResponseDto.builder().build();
+            when(mapper.toDto(cancelling)).thenReturn(dto);
+
+            TransactionSynchronizationManager.initSynchronization();
+            TestSuiteRunResponseDto result = service.cancelRun(runId);
+
+            assertThat(result).isSameAs(dto);
+            verify(sseService).notifyStatusUpdate(cancelling);
+            verify(registry, never()).cancel(runId);
+
+            for (TransactionSynchronization sync : TransactionSynchronizationManager.getSynchronizations()) {
+                sync.afterCommit();
+            }
+            verify(registry).cancel(runId);
+        }
+
+        @Test
+        @DisplayName("shouldNotCancelHandle_whenTransactionRollsBack")
+        void shouldNotCancelHandle_whenTransactionRollsBack() {
+            TestSuiteRun running = runWithStatus(RunStatus.RUNNING.name());
+            TestSuiteRun cancelling = runWithStatus(RunStatus.CANCELLING.name());
+            when(testSuiteRunRepository.findById(runId))
+                    .thenReturn(Optional.of(running))
+                    .thenReturn(Optional.of(cancelling));
+            when(testSuiteRunRepository.markCancelling(runId)).thenReturn(1);
+            when(mapper.toDto(cancelling))
+                    .thenReturn(TestSuiteRunResponseDto.builder().build());
+
+            TransactionSynchronizationManager.initSynchronization();
+            service.cancelRun(runId);
+            // Transaction rolls back: afterCommit callbacks never fire.
+            TransactionSynchronizationManager.clearSynchronization();
+
+            verify(registry, never()).cancel(runId);
+        }
+    }
+
+    @Nested
+    @DisplayName("ensureRunExists")
+    class EnsureRunExists {
+
+        @Test
+        @DisplayName("does not throw when the run exists")
+        void doesNotThrowWhenRunExists() {
+            UUID runId = UUID.randomUUID();
+            when(testSuiteRunRepository.findById(runId))
+                    .thenReturn(Optional.of(TestSuiteRun.builder().id(runId).build()));
+
+            service.ensureRunExists(runId);
+
+            verify(testSuiteRunRepository).findById(runId);
+        }
+
+        @Test
+        @DisplayName("throws EntityNotFoundException for an unknown run id")
+        void throwsWhenRunNotFound() {
+            UUID unknownRunId = UUID.randomUUID();
+            when(testSuiteRunRepository.findById(unknownRunId)).thenReturn(Optional.empty());
+
+            assertThatThrownBy(() -> service.ensureRunExists(unknownRunId)).isInstanceOf(EntityNotFoundException.class);
+        }
+    }
+
+    @Nested
+    @DisplayName("deleteRun")
+    class DeleteRun {
+
+        private final UUID runId = UUID.randomUUID();
+
+        @Test
+        @DisplayName("calls tombstone write before meta delete for COMPLETED run")
+        void callsTombstoneBeforeDeleteForCompletedRun() {
+            TestSuiteRun completedRun = TestSuiteRun.builder()
+                    .id(runId)
+                    .status(RunStatus.COMPLETED.name())
+                    .build();
+            when(testSuiteRunRepository.findById(runId)).thenReturn(Optional.of(completedRun));
+            when(testSuiteRunRepository.deleteById(runId)).thenReturn(true);
+
+            service.deleteRun(runId);
+
+            // Verify tombstone write happened
+            verify(runDeletionService).markDeleted(eq(runId));
+            verify(testSuiteRunRepository).deleteById(eq(runId));
+        }
+
+        @Test
+        @DisplayName("does not proceed to meta delete if tombstone-write throws exception")
+        void doesNotDeleteMetaIfTombstoneWriteFails() {
+            TestSuiteRun failedRun = TestSuiteRun.builder()
+                    .id(runId)
+                    .status(RunStatus.FAILED.name())
+                    .build();
+            when(testSuiteRunRepository.findById(runId)).thenReturn(Optional.of(failedRun));
+            doThrow(new RuntimeException("Analytics DB error"))
+                    .when(runDeletionService)
+                    .markDeleted(runId);
+
+            assertThatThrownBy(() -> service.deleteRun(runId))
+                    .isInstanceOf(RuntimeException.class)
+                    .hasMessage("Analytics DB error");
+
+            // Verify meta delete was never attempted
+            verify(testSuiteRunRepository, never()).deleteById(any());
+        }
+
+        @Test
+        @DisplayName("throws InvalidOperationException when run is not terminal")
+        void throwsForNonTerminalRun() {
+            TestSuiteRun runningRun = TestSuiteRun.builder()
+                    .id(runId)
+                    .status(RunStatus.RUNNING.name())
+                    .build();
+            when(testSuiteRunRepository.findById(runId)).thenReturn(Optional.of(runningRun));
+
+            assertThatThrownBy(() -> service.deleteRun(runId))
+                    .isInstanceOf(InvalidOperationException.class)
+                    .hasMessageContaining("Cannot delete a test suite run with status RUNNING");
+
+            // Verify neither tombstone nor meta delete was attempted
+            verify(runDeletionService, never()).markDeleted(any(UUID.class));
+            verify(testSuiteRunRepository, never()).deleteById(any());
+        }
+
+        @Test
+        @DisplayName("throws EntityNotFoundException when run does not exist")
+        void throwsWhenRunNotFound() {
+            when(testSuiteRunRepository.findById(runId)).thenReturn(Optional.empty());
+
+            assertThatThrownBy(() -> service.deleteRun(runId))
+                    .isInstanceOf(EntityNotFoundException.class)
+                    .hasMessageContaining("TestSuiteRun not found");
+
+            // Verify neither tombstone nor meta delete was attempted
+            verify(runDeletionService, never()).markDeleted(any(UUID.class));
+            verify(testSuiteRunRepository, never()).deleteById(any());
+        }
+    }
+}

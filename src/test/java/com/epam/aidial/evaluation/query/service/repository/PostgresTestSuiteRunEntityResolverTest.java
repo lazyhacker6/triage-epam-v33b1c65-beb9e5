@@ -1,0 +1,192 @@
+package com.epam.aidial.evaluation.query.service.repository;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+
+import com.epam.aidial.evaluation.data.db.repository.sql.json.PostgresJsonPathAccessor;
+import com.epam.aidial.evaluation.query.model.StructuredQuery;
+import com.epam.aidial.evaluation.query.service.JooqTableSchemaResolver;
+import com.epam.aidial.evaluation.query.service.QueryFieldBinding;
+import com.epam.aidial.evaluation.query.service.TestSuiteRunQueryFields;
+import com.epam.aidial.evaluation.query.service.dto.QueryFieldType;
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import org.jooq.DSLContext;
+import org.jooq.Field;
+import org.jooq.SQLDialect;
+import org.jooq.impl.DSL;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+@DisplayName("PostgresTestSuiteRunEntityResolver")
+class PostgresTestSuiteRunEntityResolverTest {
+
+    private static final List<String> EXPECTED_FIELDS = List.of(
+            "id",
+            "test_suite_id",
+            "test_run_name",
+            "status",
+            "number_of_test_cases",
+            "started_at_ms",
+            "completed_at_ms",
+            "error_message",
+            "created_at_ms",
+            "updated_at_ms",
+            "number_of_runs",
+            "suite_type",
+            "deployment_ref::id",
+            "deployment_ref::name",
+            "deployment_ref::version",
+            "deployment_ref::type",
+            "routes_ref::name",
+            "mcp_deployment_ref::id",
+            "mcp_deployment_ref::name",
+            "mcp_deployment_ref::type",
+            "mcp_deployment_ref::transport",
+            "metric_names",
+            "overall_score_threshold");
+
+    private final PostgresTestSuiteRunEntityResolver resolver = new PostgresTestSuiteRunEntityResolver(
+            mock(DSLContext.class), new JooqTableSchemaResolver(), new PostgresJsonPathAccessor());
+
+    @Test
+    @DisplayName("exposes entity name test_suite_runs")
+    void shouldExposeEntityName() {
+        assertThat(resolver.entity()).isEqualTo("test_suite_runs");
+    }
+
+    @Test
+    @DisplayName("bindings contain exactly the 23 spec'd field names and none of the excluded columns")
+    void shouldExposeExactlyTheSpecFieldSet() {
+        final Map<String, QueryFieldBinding> bindings = resolver.bindings(mock(StructuredQuery.class));
+
+        assertThat(bindings.keySet()).containsExactlyInAnyOrderElementsOf(EXPECTED_FIELDS);
+        assertThat(bindings).doesNotContainKeys("suite_snapshot", "run_config", "error_details");
+    }
+
+    @Test
+    @DisplayName("bindings do not contain the extension-only overall_score_value/total_cost keys")
+    void shouldNotBindExtensionOnlyKeys() {
+        final Map<String, QueryFieldBinding> bindings = resolver.bindings(mock(StructuredQuery.class));
+
+        assertThat(bindings)
+                .doesNotContainKeys(
+                        TestSuiteRunQueryFields.OVERALL_SCORE_VALUE_FIELD, TestSuiteRunQueryFields.TOTAL_COST_FIELD);
+    }
+
+    @Test
+    @DisplayName("every binding resolves to a non-null field on the derived table")
+    void shouldResolveEveryBindingToNonNullField() {
+        final Map<String, QueryFieldBinding> bindings = resolver.bindings(mock(StructuredQuery.class));
+
+        for (final String field : EXPECTED_FIELDS) {
+            assertThat(bindings.get(field).field())
+                    .as("binding field for %s", field)
+                    .isNotNull();
+        }
+    }
+
+    @Test
+    @DisplayName("types plain columns per the generated table and virtual fields explicitly")
+    void shouldTypeFieldsPerSpec() {
+        final Map<String, QueryFieldBinding> bindings = resolver.bindings(mock(StructuredQuery.class));
+
+        assertThat(bindings.get("id").type()).isEqualTo(QueryFieldType.UUID);
+        assertThat(bindings.get("test_suite_id").type()).isEqualTo(QueryFieldType.UUID);
+        assertThat(bindings.get("test_run_name").type()).isEqualTo(QueryFieldType.STRING);
+        assertThat(bindings.get("status").type()).isEqualTo(QueryFieldType.STRING);
+        assertThat(bindings.get("number_of_test_cases").type()).isEqualTo(QueryFieldType.INTEGER);
+        assertThat(bindings.get("started_at_ms").type()).isEqualTo(QueryFieldType.LONG);
+        assertThat(bindings.get("completed_at_ms").type()).isEqualTo(QueryFieldType.LONG);
+        assertThat(bindings.get("error_message").type()).isEqualTo(QueryFieldType.STRING);
+        assertThat(bindings.get("created_at_ms").type()).isEqualTo(QueryFieldType.LONG);
+        assertThat(bindings.get("updated_at_ms").type()).isEqualTo(QueryFieldType.LONG);
+        assertThat(bindings.get("number_of_runs").type()).isEqualTo(QueryFieldType.INTEGER);
+        assertThat(bindings.get("suite_type").type()).isEqualTo(QueryFieldType.STRING);
+        assertThat(bindings.get("deployment_ref::id").type()).isEqualTo(QueryFieldType.STRING);
+        assertThat(bindings.get("deployment_ref::name").type()).isEqualTo(QueryFieldType.STRING);
+        assertThat(bindings.get("deployment_ref::version").type()).isEqualTo(QueryFieldType.STRING);
+        assertThat(bindings.get("deployment_ref::type").type()).isEqualTo(QueryFieldType.STRING);
+        assertThat(bindings.get("routes_ref::name").type()).isEqualTo(QueryFieldType.STRING);
+        assertThat(bindings.get("mcp_deployment_ref::id").type()).isEqualTo(QueryFieldType.STRING);
+        assertThat(bindings.get("mcp_deployment_ref::name").type()).isEqualTo(QueryFieldType.STRING);
+        assertThat(bindings.get("mcp_deployment_ref::type").type()).isEqualTo(QueryFieldType.STRING);
+        assertThat(bindings.get("mcp_deployment_ref::transport").type()).isEqualTo(QueryFieldType.STRING);
+        assertThat(bindings.get("metric_names").type()).isEqualTo(QueryFieldType.ARRAY);
+        assertThat(bindings.get("overall_score_threshold").type()).isEqualTo(QueryFieldType.DECIMAL);
+    }
+
+    @Test
+    @DisplayName("derived table projects exactly the 23 spec'd field names")
+    void shouldProjectExactlyTheSpecFieldSet() {
+        final List<String> fieldNames =
+                List.of(resolver.table().fields()).stream().map(Field::getName).toList();
+
+        assertThat(fieldNames).containsExactlyInAnyOrderElementsOf(EXPECTED_FIELDS);
+    }
+
+    @Test
+    @DisplayName("derived-table field names are in parity with the resolver's binding keys")
+    void shouldBindExactlyTheProjectedFields() {
+        final Map<String, QueryFieldBinding> bindings = resolver.bindings(mock(StructuredQuery.class));
+
+        assertThat(List.of(resolver.table().fields()))
+                .extracting(Field::getName)
+                .containsExactlyInAnyOrderElementsOf(bindings.keySet());
+    }
+
+    @Test
+    @DisplayName("overall_score_threshold binds the derived numeric column with DECIMAL type")
+    void shouldBindOverallScoreThresholdAsDecimal() {
+        final QueryFieldBinding binding =
+                resolver.bindings(mock(StructuredQuery.class)).get("overall_score_threshold");
+
+        assertThat(binding).isNotNull();
+        assertThat(binding.type()).isEqualTo(QueryFieldType.DECIMAL);
+        assertThat(binding.field()).isEqualTo(resolver.table().field("overall_score_threshold"));
+        assertThat(binding.field().getType()).isEqualTo(BigDecimal.class);
+    }
+
+    @Test
+    @DisplayName(
+            "overall_score_threshold SQL extracts and casts the run's snapshot value without joining current suites")
+    void shouldExtractOverallScoreThresholdFromSnapshotOnly() {
+        final DSLContext postgres = DSL.using(SQLDialect.POSTGRES);
+        final String sql = postgres.renderInlined(postgres.selectFrom(resolver.table()));
+
+        assertThat(sql)
+                .contains("\"suite_snapshot\"->>'overallScoreThreshold'")
+                .contains("as numeric")
+                .contains("as \"overall_score_threshold\"")
+                .doesNotContain("\"test_suites\"");
+    }
+
+    @Test
+    @DisplayName("rendered SQL uses a correlated latest-computation metric_names subquery, extracts "
+            + "number_of_runs from run_config, and excludes error_details from the projection (suite_snapshot "
+            + "and run_config legitimately appear only as extraction sources, never projected as their own "
+            + "column)")
+    void shouldRenderCorrelatedMetricNamesSubqueryAndExcludeRunConfigAndErrorDetailsColumns() {
+        final DSLContext postgres = DSL.using(SQLDialect.POSTGRES);
+        final String sql =
+                postgres.render(postgres.selectFrom(resolver.table())).toLowerCase(Locale.ROOT);
+
+        // jOOQ 3.21's default POSTGRES rendering emits the ANSI "fetch next ... rows only" form for
+        // .limit(1) rather than the native "limit 1" keyword; both cap the correlated subquery to one
+        // row, which is what this assertion verifies.
+        assertThat(sql)
+                .contains("jsonb_agg(distinct \"rms\".\"tsmd_name\" order by \"rms\".\"tsmd_name\")")
+                .contains("\"computed_at_ms\" desc")
+                .contains("\"computation_id\" asc")
+                .contains("fetch next")
+                .contains("rows only")
+                .contains("coalesce(")
+                .contains("\"run_config\"->>")
+                .contains("as \"number_of_runs\"")
+                .doesNotContain("\"tsr\".\"run_config\"")
+                .doesNotContain("as \"run_config\"")
+                .doesNotContain("error_details");
+    }
+}

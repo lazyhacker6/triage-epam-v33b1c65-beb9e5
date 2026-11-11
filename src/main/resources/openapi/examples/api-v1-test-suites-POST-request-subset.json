@@ -1,0 +1,13 @@
+{
+  "name": "Unbound Test Suite",
+  "datasetId": null,
+  "deploymentRef": {
+    "id": "deploy-001",
+    "name": "Production",
+    "type": "dial-application"
+  },
+  "endpointRef": {
+    "method": "POST",
+    "relativeUrlPattern": "/chat/completions"
+  }
+}

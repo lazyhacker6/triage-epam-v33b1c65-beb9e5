@@ -1,0 +1,47 @@
+{
+  "$type": "dial-model",
+  "deploymentId": "gpt-5-mini-2025-08-07",
+  "displayName": "GPT-5 mini",
+  "version": "2025-08-07",
+  "description": "GPT-5 mini - powers real-time experiences for apps and agents.",
+  "owner": "organization-owner",
+  "reference": "gpt-5-mini-2025-08-07",
+  "createdAt": 1768856213216,
+  "updatedAt": 1768856213216,
+  "descriptionKeywords": ["Text Generation", "Continue Supported"],
+  "inputAttachmentTypes": ["*/*"],
+  "interfaces": ["chat", "openaiChatCompletions"],
+  "features": {
+    "rate": true,
+    "tokenize": true,
+    "truncate_prompt": true,
+    "configuration": false,
+    "system_prompt": true,
+    "tools": true,
+    "seed": true,
+    "url_attachments": false,
+    "folder_attachments": false,
+    "allow_resume": true,
+    "accessible_by_per_request_key": true,
+    "content_parts": true,
+    "temperature": true,
+    "addons": true
+  },
+  "capabilities": {
+    "scaleTypes": ["standard"],
+    "completion": false,
+    "chatCompletion": true,
+    "embeddings": false,
+    "fineTune": false,
+    "inference": false
+  },
+  "limits": {
+    "maxTotalTokens": 128000,
+    "maxCompletionTokens": 4096
+  },
+  "pricing": {
+    "unit": "token",
+    "prompt": "0.15",
+    "completion": "0.60"
+  }
+}

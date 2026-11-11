@@ -1,0 +1,562 @@
+package com.epam.aidial.evaluation.runner.job;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
+
+import com.epam.aidial.evaluation.runner.client.mcp.McpInvocationException;
+import com.epam.aidial.evaluation.runner.client.mcp.McpToolInvoker;
+import com.epam.aidial.evaluation.runner.dto.ArgumentTemplateDto;
+import com.epam.aidial.evaluation.runner.dto.DeploymentReferenceDto;
+import com.epam.aidial.evaluation.runner.dto.McpDeploymentReferenceDto;
+import com.epam.aidial.evaluation.runner.dto.ResponseColumnDefinitionDto;
+import com.epam.aidial.evaluation.runner.dto.ToolReferenceDto;
+import com.epam.aidial.evaluation.runner.model.ExecutionStatus;
+import com.epam.aidial.evaluation.runner.model.TestCaseRunInput;
+import com.epam.aidial.evaluation.runner.model.TestCaseRunResult;
+import com.epam.aidial.evaluation.runner.model.suite.HttpSuite;
+import com.epam.aidial.evaluation.runner.model.suite.McpSuite;
+import com.epam.aidial.evaluation.runner.model.suite.SuiteDefinitions;
+import com.epam.aidial.evaluation.runner.model.target.DeploymentTarget;
+import com.epam.aidial.evaluation.runner.model.target.HttpTarget;
+import com.epam.aidial.evaluation.runner.model.target.McpToolTarget;
+import com.epam.aidial.evaluation.runner.model.target.RouteTarget;
+import com.epam.aidial.evaluation.runner.service.McpRequestResolver;
+import com.epam.aidial.evaluation.runner.service.McpResponseSerializer;
+import com.epam.aidial.evaluation.runner.service.ResponseColumnExtractor;
+import com.epam.aidial.evaluation.runner.util.CallerCredential;
+import com.epam.aidial.evaluation.runner.util.RunnerJsonbMapper;
+import com.epam.aidial.evaluation.runner.util.TracingConstants;
+import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
+import io.modelcontextprotocol.spec.McpSchema.TextContent;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.Executors;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Answers;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
+
+/**
+ * Every HTTP-suite (DEPLOYMENT or ROUTE) test case (single-request or multi-request chain, single-turn or multi-turn alike)
+ * is delegated whole to {@link RequestChainExecutor}; {@link EvaluationWorker} itself only decides
+ * MCP-vs-HTTP dispatch, builds the tracing span/baggage, and owns the MCP execution path end to end.
+ * HTTP-path behavior (retries, timeouts, header filtering, turn-loop/chain semantics) is covered by
+ * {@link TurnLoopExecutorTest} and {@link RequestChainExecutorTest}.
+ */
+@DisplayName("EvaluationWorker")
+@ExtendWith(MockitoExtension.class)
+class EvaluationWorkerTest {
+
+    @Mock
+    private ResponseColumnExtractor responseColumnExtractor;
+
+    @Mock
+    private RunnerJsonbMapper jsonbMapper;
+
+    @Mock(answer = Answers.RETURNS_DEEP_STUBS)
+    private OpenTelemetry openTelemetry;
+
+    @Mock
+    private McpToolInvoker mcpToolInvoker;
+
+    @Mock
+    private McpRequestResolver mcpRequestResolver;
+
+    @Mock
+    private McpResponseSerializer mcpResponseSerializer;
+
+    @Mock
+    private RequestChainExecutor requestChainExecutor;
+
+    @Mock(answer = Answers.RETURNS_DEEP_STUBS)
+    private Span span;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private static final Clock FIXED_CLOCK = Clock.fixed(Instant.parse("2026-01-01T00:00:00Z"), ZoneId.of("UTC"));
+
+    private EvaluationWorker worker;
+
+    @BeforeEach
+    void setUp() {
+        worker = new EvaluationWorker(
+                responseColumnExtractor,
+                objectMapper,
+                jsonbMapper,
+                openTelemetry,
+                mcpToolInvoker,
+                mcpRequestResolver,
+                mcpResponseSerializer,
+                FIXED_CLOCK,
+                requestChainExecutor);
+    }
+
+    @Test
+    @DisplayName("Should delegate every DEPLOYMENT case to TurnLoopExecutor and return its rows unchanged")
+    void execute_deploymentSuite_delegatesToTurnLoopExecutor() {
+        TestCaseRunInput input = buildTestCaseRunInput();
+        EvaluationContext context = buildContext();
+        List<ResponseColumnDefinitionDto> responseColumns = List.of();
+
+        TestCaseRunResult stubbedRow = TestCaseRunResult.builder()
+                .id(UUID.randomUUID())
+                .executionStatus(ExecutionStatus.SUCCESS)
+                .build();
+        // traceId is null here (the mocked OpenTelemetry span isn't stubbed valid) — match with any(),
+        // not anyString(), since anyString() rejects null and would misroute this call to the outer
+        // catch block instead of the stub.
+        when(requestChainExecutor.execute(eq(input), any(HttpSuite.class), eq(context), eq(0), any(), anyLong()))
+                .thenReturn(List.of(stubbedRow));
+
+        List<TestCaseRunResult> results = worker.execute(input, context, 0, responseColumns);
+
+        assertThat(results).containsExactly(stubbedRow);
+    }
+
+    @Test
+    @DisplayName(
+            "HTTP request and turn result rows share one execution root trace linked to the run")
+    void requestAndTurnRowsShareLinkedExecutionRoot() {
+        final InMemorySpanExporter exporter = InMemorySpanExporter.create();
+        try (OpenTelemetrySdk telemetry = OpenTelemetrySdk.builder()
+                .setTracerProvider(SdkTracerProvider.builder()
+                        .addSpanProcessor(SimpleSpanProcessor.create(exporter))
+                        .build())
+                .build()) {
+            final EvaluationContext original = buildContext();
+            final Span runSpan = telemetry.getTracer("test").spanBuilder("run").startSpan();
+            try (EvaluationTraceSession session = new EvaluationTraceSession(runSpan.getSpanContext())) {
+                final EvaluationContext context =
+                        original.toBuilder().traceSession(session).build();
+                final TestCaseRunInput input = buildTestCaseRunInput();
+                when(requestChainExecutor.execute(any(), any(), any(), eq(0), anyString(), anyLong()))
+                        .thenAnswer(inv -> {
+                            final String traceId = inv.getArgument(4);
+                            final Span downstream = telemetry
+                                    .getTracer("test")
+                                    .spanBuilder("deployment")
+                                    .startSpan();
+                            downstream.end();
+                            return List.of(
+                                    TestCaseRunResult.builder()
+                                            .requestIndex(0)
+                                            .turnIndex(0)
+                                            .traceId(traceId)
+                                            .build(),
+                                    TestCaseRunResult.builder()
+                                            .requestIndex(1)
+                                            .turnIndex(1)
+                                            .traceId(traceId)
+                                            .build());
+                        });
+                final EvaluationWorker tracedWorker = new EvaluationWorker(
+                        responseColumnExtractor,
+                        objectMapper,
+                        jsonbMapper,
+                        telemetry,
+                        mcpToolInvoker,
+                        mcpRequestResolver,
+                        mcpResponseSerializer,
+                        FIXED_CLOCK,
+                        requestChainExecutor);
+                final List<TestCaseRunResult> rows = tracedWorker.execute(input, context, 0, List.of());
+                assertThat(rows).hasSize(2);
+                assertThat(rows.get(0).getTraceId())
+                        .isEqualTo(rows.get(1).getTraceId())
+                        .isNotEqualTo(runSpan.getSpanContext().getTraceId());
+            }
+            final var execution = exporter.getFinishedSpanItems().stream()
+                    .filter(s -> s.getName().equals(TracingConstants.SPAN_EVAL_TESTCASE_EXECUTE))
+                    .findFirst()
+                    .orElseThrow();
+            final var downstream = exporter.getFinishedSpanItems().stream()
+                    .filter(s -> s.getName().equals("deployment"))
+                    .findFirst()
+                    .orElseThrow();
+            assertThat(execution.getParentSpanContext().isValid()).isFalse();
+            assertThat(execution.getTraceId()).isNotEqualTo(runSpan.getSpanContext().getTraceId());
+            assertThat(downstream.getParentSpanId()).isEqualTo(execution.getSpanId());
+            assertThat(execution.getLinks())
+                    .singleElement()
+                    .satisfies(l -> assertThat(l.getSpanContext()).isEqualTo(runSpan.getSpanContext()));
+            runSpan.end();
+        }
+    }
+
+    @Test
+    @DisplayName("Should delegate a ROUTE target to the request chain, not the MCP path")
+    void execute_routeTarget_delegatesToRequestChainExecutor() {
+        TestCaseRunInput input = buildTestCaseRunInput();
+        EvaluationContext context = buildContext(new RouteTarget(null));
+        TestCaseRunResult stubbedRow = TestCaseRunResult.builder()
+                .id(UUID.randomUUID())
+                .executionStatus(ExecutionStatus.SUCCESS)
+                .build();
+        when(requestChainExecutor.execute(eq(input), any(HttpSuite.class), eq(context), eq(0), any(), anyLong()))
+                .thenReturn(List.of(stubbedRow));
+
+        List<TestCaseRunResult> results = worker.execute(input, context, 0, List.of());
+
+        assertThat(results).containsExactly(stubbedRow);
+        verifyNoInteractions(mcpToolInvoker);
+    }
+
+    @Test
+    @DisplayName("Should pass the span's traceId through to TurnLoopExecutor")
+    void execute_deploymentSuite_passesTraceIdToTurnLoopExecutor() {
+        String expectedTraceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+        when(openTelemetry
+                        .getTracer(anyString())
+                        .spanBuilder(anyString())
+                        .setAttribute(anyString(), anyString())
+                        .setAttribute(anyString(), anyString())
+                        .setAttribute(anyString(), anyString())
+                        .setAttribute(anyString(), anyString())
+                        .setAttribute(anyString(), anyString())
+                        .setAttribute(anyString(), anyString())
+                        .startSpan()
+                        .getSpanContext()
+                        .isValid())
+                .thenReturn(true);
+        when(openTelemetry
+                        .getTracer(anyString())
+                        .spanBuilder(anyString())
+                        .setAttribute(anyString(), anyString())
+                        .setAttribute(anyString(), anyString())
+                        .setAttribute(anyString(), anyString())
+                        .setAttribute(anyString(), anyString())
+                        .setAttribute(anyString(), anyString())
+                        .setAttribute(anyString(), anyString())
+                        .startSpan()
+                        .getSpanContext()
+                        .getTraceId())
+                .thenReturn(expectedTraceId);
+
+        TestCaseRunInput input = buildTestCaseRunInput();
+        EvaluationContext context = buildContext();
+        List<ResponseColumnDefinitionDto> responseColumns = List.of();
+        when(requestChainExecutor.execute(any(), any(HttpSuite.class), any(), eq(0), anyString(), anyLong()))
+                .thenReturn(List.of());
+
+        worker.execute(input, context, 0, responseColumns);
+
+        ArgumentCaptor<String> traceIdCaptor = ArgumentCaptor.forClass(String.class);
+        verify(requestChainExecutor)
+                .execute(eq(input), any(HttpSuite.class), eq(context), eq(0), traceIdCaptor.capture(), anyLong());
+        assertThat(traceIdCaptor.getValue()).isEqualTo(expectedTraceId);
+    }
+
+    @Test
+    @DisplayName("Should return an ERROR result when TurnLoopExecutor throws unexpectedly")
+    void execute_turnLoopExecutorThrows_returnsErrorResult() {
+        TestCaseRunInput input = buildTestCaseRunInput();
+        EvaluationContext context = buildContext();
+        List<ResponseColumnDefinitionDto> responseColumns = List.of();
+
+        when(requestChainExecutor.execute(any(), any(HttpSuite.class), any(), eq(0), any(), anyLong()))
+                .thenThrow(new IllegalStateException("boom"));
+        when(responseColumnExtractor.extract(anyList(), anyString(), any()))
+                .thenReturn(new ResponseColumnExtractor.ExtractionResult("{}", "[]", Map.of()));
+
+        TestCaseRunResult result =
+                worker.execute(input, context, 0, responseColumns).getFirst();
+
+        assertThat(result.getExecutionStatus()).isEqualTo(ExecutionStatus.ERROR);
+        assertThat(result.getResponseBody()).contains("REQUEST_RESOLUTION_ERROR");
+    }
+
+    @Test
+    @DisplayName("Should mark the span ERROR when TurnLoopExecutor returns a row with ExecutionStatus.ERROR")
+    void execute_turnLoopExecutorReturnsErrorRow_marksSpanError() {
+        stubSpanChainReturns(span);
+
+        TestCaseRunInput input = buildTestCaseRunInput();
+        EvaluationContext context = buildContext();
+        List<ResponseColumnDefinitionDto> responseColumns = List.of();
+        TestCaseRunResult errorRow = TestCaseRunResult.builder()
+                .id(UUID.randomUUID())
+                .executionStatus(ExecutionStatus.ERROR)
+                .logDetails("{\"error\":\"boom\"}")
+                .build();
+        when(requestChainExecutor.execute(eq(input), any(HttpSuite.class), eq(context), eq(0), any(), anyLong()))
+                .thenReturn(List.of(errorRow));
+
+        worker.execute(input, context, 0, responseColumns);
+
+        verify(span).setStatus(StatusCode.ERROR, "{\"error\":\"boom\"}");
+    }
+
+    @Test
+    @DisplayName("Should not mark the span ERROR when TurnLoopExecutor returns only SUCCESS/FAILED rows")
+    void execute_turnLoopExecutorReturnsOnlySuccessOrFailedRows_doesNotMarkSpanError() {
+        stubSpanChainReturns(span);
+
+        TestCaseRunInput input = buildTestCaseRunInput();
+        EvaluationContext context = buildContext();
+        List<ResponseColumnDefinitionDto> responseColumns = List.of();
+        TestCaseRunResult successRow = TestCaseRunResult.builder()
+                .id(UUID.randomUUID())
+                .executionStatus(ExecutionStatus.SUCCESS)
+                .build();
+        TestCaseRunResult failedRow = TestCaseRunResult.builder()
+                .id(UUID.randomUUID())
+                .executionStatus(ExecutionStatus.FAILED)
+                .build();
+        when(requestChainExecutor.execute(eq(input), any(HttpSuite.class), eq(context), eq(0), any(), anyLong()))
+                .thenReturn(List.of(successRow, failedRow));
+
+        worker.execute(input, context, 0, responseColumns);
+
+        verify(span, never()).setStatus(eq(StatusCode.ERROR), any());
+    }
+
+    private void stubSpanChainReturns(Span stubbedSpan) {
+        when(openTelemetry
+                        .getTracer(anyString())
+                        .spanBuilder(anyString())
+                        .setAttribute(anyString(), anyString())
+                        .setAttribute(anyString(), anyString())
+                        .setAttribute(anyString(), anyString())
+                        .setAttribute(anyString(), anyString())
+                        .setAttribute(anyString(), anyString())
+                        .setAttribute(anyString(), anyString())
+                        .startSpan())
+                .thenReturn(stubbedSpan);
+    }
+
+    // ------------------------------------------------------------------
+    // MCP execution path tests
+    // ------------------------------------------------------------------
+
+    @Nested
+    @DisplayName("MCP execution path")
+    class McpExecutionPath {
+
+        @Test
+        @DisplayName("Should return SUCCESS for successful MCP tool call")
+        void execute_mcpSuccess_returnsSuccessResult() throws Exception {
+            TestCaseRunInput input = buildTestCaseRunInput();
+            EvaluationContext context = buildMcpContext();
+
+            CallToolResult callResult = new CallToolResult(
+                    List.of(TextContent.builder("result text").build()), false, null, null);
+
+            when(mcpRequestResolver.resolve(any(), any(), any(), any()))
+                    .thenReturn(McpRequestResolver.ResolutionResult.builder()
+                            .arguments(Map.of("query", "test"))
+                            .warnings(List.of())
+                            .build());
+            when(mcpToolInvoker.callTool(
+                            eq("my-toolset"), eq("search"), any(), eq(CallerCredential.bearer("test-token")), any()))
+                    .thenReturn(callResult);
+            when(mcpResponseSerializer.serialize(callResult))
+                    .thenReturn("{\"content\":[{\"type\":\"text\",\"text\":\"result text\"}]}");
+            when(responseColumnExtractor.extract(anyList(), anyString(), any()))
+                    .thenReturn(new ResponseColumnExtractor.ExtractionResult("{}", "[]", Map.of()));
+
+            TestCaseRunResult result =
+                    worker.execute(input, context, 0, List.of()).getFirst();
+
+            assertThat(result.getExecutionStatus()).isEqualTo(ExecutionStatus.SUCCESS);
+            assertThat(result.getResponseBody()).contains("result text");
+            assertThat(result.getResponseStatusCode()).isNull();
+            assertThat(result.getRequestBody()).isNotNull();
+        }
+
+        @Test
+        @DisplayName("Should return FAILED when MCP tool returns isError=true")
+        void execute_mcpIsError_returnsFailedResult() throws Exception {
+            TestCaseRunInput input = buildTestCaseRunInput();
+            EvaluationContext context = buildMcpContext();
+
+            CallToolResult errorResult =
+                    new CallToolResult(List.of(TextContent.builder("tool error").build()), true, null, null);
+
+            when(mcpRequestResolver.resolve(any(), any(), any(), any()))
+                    .thenReturn(McpRequestResolver.ResolutionResult.builder()
+                            .arguments(Map.of("query", "bad"))
+                            .warnings(List.of())
+                            .build());
+            when(mcpToolInvoker.callTool(any(), any(), any(), any(), any())).thenReturn(errorResult);
+            when(mcpResponseSerializer.serialize(errorResult))
+                    .thenReturn("{\"content\":[{\"type\":\"text\",\"text\":\"tool error\"}],\"isError\":true}");
+            when(responseColumnExtractor.extract(anyList(), anyString(), any()))
+                    .thenReturn(new ResponseColumnExtractor.ExtractionResult("{}", "[]", Map.of()));
+
+            TestCaseRunResult result =
+                    worker.execute(input, context, 0, List.of()).getFirst();
+
+            assertThat(result.getExecutionStatus()).isEqualTo(ExecutionStatus.FAILED);
+        }
+
+        @Test
+        @DisplayName("Should return TIMEOUT when MCP invocation throws 504 McpInvocationException")
+        void execute_mcpTimeout_returnsTimeoutResult() throws Exception {
+            TestCaseRunInput input = buildTestCaseRunInput();
+            EvaluationContext context = buildMcpContext();
+
+            when(mcpRequestResolver.resolve(any(), any(), any(), any()))
+                    .thenReturn(McpRequestResolver.ResolutionResult.builder()
+                            .arguments(Map.of("query", "test"))
+                            .warnings(List.of())
+                            .build());
+            when(mcpToolInvoker.callTool(any(), any(), any(), any(), any()))
+                    .thenThrow(new McpInvocationException(504, "MCP_TIMEOUT", "MCP tool invocation timed out"));
+            when(responseColumnExtractor.extract(anyList(), anyString(), any()))
+                    .thenReturn(new ResponseColumnExtractor.ExtractionResult("{}", "[]", Map.of()));
+
+            TestCaseRunResult result =
+                    worker.execute(input, context, 0, List.of()).getFirst();
+
+            assertThat(result.getExecutionStatus()).isEqualTo(ExecutionStatus.TIMEOUT);
+            assertThat(result.getResponseBody()).contains("MCP_INVOCATION_ERROR");
+        }
+
+        @Test
+        @DisplayName("Should return ERROR when MCP invocation throws 502 McpInvocationException")
+        void execute_mcpConnectionError_returnsErrorResult() throws Exception {
+            TestCaseRunInput input = buildTestCaseRunInput();
+            EvaluationContext context = buildMcpContext();
+
+            when(mcpRequestResolver.resolve(any(), any(), any(), any()))
+                    .thenReturn(McpRequestResolver.ResolutionResult.builder()
+                            .arguments(Map.of("query", "test"))
+                            .warnings(List.of())
+                            .build());
+            when(mcpToolInvoker.callTool(any(), any(), any(), any(), any()))
+                    .thenThrow(new McpInvocationException(
+                            502, "MCP_CONNECTION_ERROR", "Failed to connect to MCP endpoint"));
+            when(responseColumnExtractor.extract(anyList(), anyString(), any()))
+                    .thenReturn(new ResponseColumnExtractor.ExtractionResult("{}", "[]", Map.of()));
+
+            TestCaseRunResult result =
+                    worker.execute(input, context, 0, List.of()).getFirst();
+
+            assertThat(result.getExecutionStatus()).isEqualTo(ExecutionStatus.ERROR);
+            assertThat(result.getResponseBody()).contains("MCP_INVOCATION_ERROR");
+        }
+
+        @Test
+        @DisplayName("Should return ERROR when MCP response serialization fails")
+        void execute_mcpSerializationFails_returnsErrorResult() throws Exception {
+            TestCaseRunInput input = buildTestCaseRunInput();
+            EvaluationContext context = buildMcpContext();
+
+            CallToolResult callResult =
+                    new CallToolResult(List.of(TextContent.builder("result").build()), false, null, null);
+
+            when(mcpRequestResolver.resolve(any(), any(), any(), any()))
+                    .thenReturn(McpRequestResolver.ResolutionResult.builder()
+                            .arguments(Map.of("query", "test"))
+                            .warnings(List.of())
+                            .build());
+            when(mcpToolInvoker.callTool(any(), any(), any(), any(), any())).thenReturn(callResult);
+            when(mcpResponseSerializer.serialize(callResult)).thenThrow(new JacksonException("serialization error") {});
+            when(responseColumnExtractor.extract(anyList(), anyString(), any()))
+                    .thenReturn(new ResponseColumnExtractor.ExtractionResult("{}", "[]", Map.of()));
+
+            TestCaseRunResult result =
+                    worker.execute(input, context, 0, List.of()).getFirst();
+
+            assertThat(result.getExecutionStatus()).isEqualTo(ExecutionStatus.ERROR);
+            assertThat(result.getResponseBody()).contains("MCP_INVOCATION_ERROR");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Helper methods
+    // ------------------------------------------------------------------
+    private EvaluationContext buildContext() {
+        return buildContext(new DeploymentTarget(
+                DeploymentReferenceDto.builder().id("gpt-4").build()));
+    }
+
+    private EvaluationContext buildContext(HttpTarget target) {
+        return EvaluationContext.builder()
+                .runId(UUID.randomUUID())
+                .suiteId(UUID.randomUUID())
+                .numberOfRuns(1)
+                .numberOfTestCases(1)
+                .concurrencyLevel(1)
+                .requestTimeoutMs(30000L)
+                .maxRetries(0)
+                .retryDelayMs(100L)
+                .retryBackoffMultiplier(2.0)
+                .maxRetryDelayMs(1000L)
+                .resultBatchSize(100)
+                .maxResponseSizeBytes(5242880L)
+                .executor(Executors.newVirtualThreadPerTaskExecutor())
+                .credential(CallerCredential.bearer("test-token"))
+                .createdAtMs(System.currentTimeMillis())
+                .suite(new HttpSuite(target, SuiteDefinitions.httpChain(null, null, null, List.of(), List.of(), null)))
+                .build();
+    }
+
+    private TestCaseRunInput buildTestCaseRunInput() {
+        return TestCaseRunInput.builder()
+                .runId(UUID.randomUUID())
+                .position(0)
+                .testCaseId(UUID.randomUUID())
+                .testCaseName("test-case-1")
+                .testCaseData("{}")
+                .build();
+    }
+
+    private EvaluationContext buildMcpContext() {
+        final McpToolTarget target = new McpToolTarget(
+                McpDeploymentReferenceDto.builder()
+                        .id("my-toolset")
+                        .type("dial-toolset")
+                        .build(),
+                ToolReferenceDto.builder()
+                        .name("search")
+                        .inputSchema(Map.of("type", "object"))
+                        .build());
+        final ArgumentTemplateDto argumentTemplate = ArgumentTemplateDto.builder()
+                .arguments(Map.of("query", "${{userQuery}}"))
+                .build();
+        return EvaluationContext.builder()
+                .runId(UUID.randomUUID())
+                .suiteId(UUID.randomUUID())
+                .numberOfRuns(1)
+                .numberOfTestCases(1)
+                .concurrencyLevel(1)
+                .requestTimeoutMs(30000L)
+                .maxRetries(0)
+                .retryDelayMs(100L)
+                .retryBackoffMultiplier(2.0)
+                .maxRetryDelayMs(1000L)
+                .resultBatchSize(100)
+                .maxResponseSizeBytes(5242880L)
+                .executor(Executors.newVirtualThreadPerTaskExecutor())
+                .credential(CallerCredential.bearer("test-token"))
+                .createdAtMs(FIXED_CLOCK.millis())
+                .suite(new McpSuite(target, argumentTemplate, List.of(), List.of()))
+                .build();
+    }
+}

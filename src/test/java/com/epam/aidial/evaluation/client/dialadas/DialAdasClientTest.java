@@ -1,0 +1,147 @@
+package com.epam.aidial.evaluation.client.dialadas;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.springframework.test.web.client.match.MockRestRequestMatchers.content;
+import static org.springframework.test.web.client.match.MockRestRequestMatchers.method;
+import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
+import static org.springframework.test.web.client.response.MockRestResponseCreators.withServerError;
+import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
+
+import com.epam.aidial.evaluation.client.dialadas.dto.AdasAggregateResponseDto;
+import com.epam.aidial.evaluation.client.dialadas.dto.AdasRunAvgCostRowDto;
+import com.epam.aidial.evaluation.query.model.QueryMode;
+import com.epam.aidial.evaluation.query.model.StructuredQuery;
+import java.io.IOException;
+import java.net.SocketTimeoutException;
+import java.util.List;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.client.ClientHttpRequestInterceptor;
+import org.springframework.http.client.ClientHttpResponse;
+import org.springframework.test.web.client.MockRestServiceServer;
+import org.springframework.web.client.RestClient;
+
+@DisplayName("DialAdasClient")
+class DialAdasClientTest {
+
+    private MockRestServiceServer server;
+    private RestClient.Builder builder;
+    private DialAdasClient client;
+
+    @BeforeEach
+    void setUp() {
+        builder = RestClient.builder().baseUrl("http://dial-adas.local");
+        server = MockRestServiceServer.bindTo(builder).build();
+        client = new DialAdasClient(builder.build());
+    }
+
+    @Test
+    @DisplayName("executeAggregate posts the query body and parses the aggregate response")
+    void executeAggregatePostsQueryAndParsesResponse() {
+        StructuredQuery query = new StructuredQuery(
+                "dial_usage_log", null, QueryMode.AGGREGATE, false, List.of(), List.of(), null, null, null);
+
+        server.expect(requestTo("http://dial-adas.local/v1/queries/execute"))
+                .andExpect(method(HttpMethod.POST))
+                .andExpect(content().contentType(MediaType.APPLICATION_JSON))
+                .andExpect(content().json("{\"entity\":\"dial_usage_log\",\"mode\":\"aggregate\"}"))
+                .andRespond(withSuccess(
+                        "{\"rows\":[{\"count\":29159,\"avg_cost\":0.004220310571493558}]}",
+                        MediaType.APPLICATION_JSON));
+
+        AdasAggregateResponseDto<AdasRunAvgCostRowDto> response =
+                client.executeAggregate(query, AdasRunAvgCostRowDto.class);
+
+        assertThat(response).isNotNull();
+        assertThat(response.getRows()).hasSize(1);
+        assertThat(response.getRows().get(0).getCount()).isEqualTo(29159L);
+        assertThat(response.getRows().get(0).getAvgCost()).isEqualTo(0.004220310571493558);
+        server.verify();
+    }
+
+    @Test
+    @DisplayName("throws DialAdasClientException with 502 on 5xx response")
+    void throwsClientExceptionOn5xx() {
+        StructuredQuery query =
+                new StructuredQuery("dial_usage_log", null, QueryMode.AGGREGATE, false, null, null, null, null, null);
+        server.expect(requestTo("http://dial-adas.local/v1/queries/execute")).andRespond(withServerError());
+
+        assertThatThrownBy(() -> client.executeAggregate(query, AdasRunAvgCostRowDto.class))
+                .isInstanceOf(DialAdasClientException.class)
+                .extracting(ex -> ((DialAdasClientException) ex).getStatusCode())
+                .isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR.value());
+        server.verify();
+    }
+
+    @Test
+    @DisplayName("throws DialAdasClientException with 504 on connection timeout")
+    void throwsClientExceptionOnTimeout() {
+        ClientHttpRequestInterceptor timeoutInterceptor = (request, body, execution) -> throwSocketTimeout();
+        RestClient timeoutClient =
+                builder.requestInterceptor(timeoutInterceptor).build();
+        DialAdasClient timeoutBoundClient = new DialAdasClient(timeoutClient);
+        StructuredQuery query =
+                new StructuredQuery("dial_usage_log", null, QueryMode.AGGREGATE, false, null, null, null, null, null);
+
+        assertThatThrownBy(() -> timeoutBoundClient.executeAggregate(query, AdasRunAvgCostRowDto.class))
+                .isInstanceOf(DialAdasClientException.class)
+                .extracting(ex -> ((DialAdasClientException) ex).getStatusCode())
+                .isEqualTo(HttpStatus.GATEWAY_TIMEOUT.value());
+    }
+
+    @Test
+    @DisplayName("executeSql posts the sql body and parses the aggregate response")
+    void executeSqlPostsSqlAndParsesResponse() {
+        server.expect(requestTo("http://dial-adas.local/v1/queries/execute-sql"))
+                .andExpect(method(HttpMethod.POST))
+                .andExpect(content().contentType(MediaType.APPLICATION_JSON))
+                .andExpect(content().json("{\"sql\":\"SELECT avg(case_cost) AS avg_cost\"}"))
+                .andRespond(
+                        withSuccess("{\"rows\":[{\"count\":4,\"avg_cost\":5.40875E-4}]}", MediaType.APPLICATION_JSON));
+
+        AdasAggregateResponseDto<AdasRunAvgCostRowDto> response =
+                client.executeSql("SELECT avg(case_cost) AS avg_cost", AdasRunAvgCostRowDto.class);
+
+        assertThat(response).isNotNull();
+        assertThat(response.getRows()).hasSize(1);
+        assertThat(response.getRows().get(0).getCount()).isEqualTo(4L);
+        assertThat(response.getRows().get(0).getAvgCost()).isEqualTo(5.40875E-4);
+        server.verify();
+    }
+
+    @Test
+    @DisplayName("executeSql throws DialAdasClientException with 502 on 5xx response")
+    void executeSqlThrowsClientExceptionOn5xx() {
+        server.expect(requestTo("http://dial-adas.local/v1/queries/execute-sql"))
+                .andRespond(withServerError());
+
+        assertThatThrownBy(() -> client.executeSql("SELECT 1", AdasRunAvgCostRowDto.class))
+                .isInstanceOf(DialAdasClientException.class)
+                .extracting(ex -> ((DialAdasClientException) ex).getStatusCode())
+                .isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR.value());
+        server.verify();
+    }
+
+    @Test
+    @DisplayName("executeSql throws DialAdasClientException with 504 on connection timeout")
+    void executeSqlThrowsClientExceptionOnTimeout() {
+        ClientHttpRequestInterceptor timeoutInterceptor = (request, body, execution) -> throwSocketTimeout();
+        RestClient timeoutClient =
+                builder.requestInterceptor(timeoutInterceptor).build();
+        DialAdasClient timeoutBoundClient = new DialAdasClient(timeoutClient);
+
+        assertThatThrownBy(() -> timeoutBoundClient.executeSql("SELECT 1", AdasRunAvgCostRowDto.class))
+                .isInstanceOf(DialAdasClientException.class)
+                .extracting(ex -> ((DialAdasClientException) ex).getStatusCode())
+                .isEqualTo(HttpStatus.GATEWAY_TIMEOUT.value());
+    }
+
+    private static ClientHttpResponse throwSocketTimeout() throws IOException {
+        throw new SocketTimeoutException("Read timed out");
+    }
+}

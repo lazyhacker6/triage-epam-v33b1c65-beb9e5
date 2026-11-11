@@ -1,0 +1,18 @@
+name: PR Workflow
+
+on:
+  pull_request:
+    branches: [development, release-*]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  run_tests:
+    uses: epam/ai-dial-ci/.github/workflows/java_pr.yml@4.13.2
+    with:
+      java-version: "25"
+      trivy-severity: "CRITICAL,HIGH,MEDIUM,LOW"
+      trivy-severity-for-sarif: "CRITICAL,HIGH,MEDIUM,LOW"
+    secrets: inherit

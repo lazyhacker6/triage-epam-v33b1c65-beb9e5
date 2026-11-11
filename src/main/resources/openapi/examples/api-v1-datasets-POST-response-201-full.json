@@ -1,0 +1,38 @@
+{
+  "id": "660e8400-e29b-41d4-a716-446655440001",
+  "name": "Suite-Owned Dataset",
+  "description": "PRIVATE dataset owned by a single test suite — atomic create-and-bind",
+  "visibility": "PRIVATE",
+  "testCaseSchema": [
+    {
+      "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+      "name": "question",
+      "displayName": "Question",
+      "type": "STRING",
+      "required": true,
+      "perTurn": true
+    },
+    {
+      "id": "a3bb189e-8bf9-3888-9912-ace4e6543002",
+      "name": "expected_answer",
+      "displayName": "Expected Answer",
+      "type": "STRING",
+      "required": false,
+      "perTurn": true
+    },
+    {
+      "id": "1b4e28ba-2fa1-11d2-883f-0016d3cca427",
+      "name": "tags",
+      "displayName": "Tags",
+      "type": "STRING",
+      "required": false,
+      "perTurn": false
+    }
+  ],
+  "valid": true,
+  "validationWarnings": [],
+  "version": 1,
+  "createdBy": "maintainer@example.com",
+  "createdAt": 1704067200000,
+  "updatedAt": 1704067200000
+}

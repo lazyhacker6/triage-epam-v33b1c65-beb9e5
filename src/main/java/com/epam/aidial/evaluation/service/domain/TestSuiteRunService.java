@@ -1,0 +1,515 @@
+package com.epam.aidial.evaluation.service.domain;
+
+import com.epam.aidial.evaluation.client.dialcore.DialRouteTriggerClient;
+import com.epam.aidial.evaluation.client.dialcore.DialRouteTriggerException;
+import com.epam.aidial.evaluation.configuration.properties.dialapp.DialAppProperties;
+import com.epam.aidial.evaluation.configuration.properties.testsuite.TestSuiteRunProperties;
+import com.epam.aidial.evaluation.data.db.model.RunStatus;
+import com.epam.aidial.evaluation.data.db.model.TestSuite;
+import com.epam.aidial.evaluation.data.db.model.TestSuiteRun;
+import com.epam.aidial.evaluation.data.db.model.filter.FilterCondition;
+import com.epam.aidial.evaluation.data.db.model.pagination.Page;
+import com.epam.aidial.evaluation.data.db.model.pagination.PageRequest;
+import com.epam.aidial.evaluation.data.db.repository.TestSuiteRepository;
+import com.epam.aidial.evaluation.data.db.repository.TestSuiteRunRepository;
+import com.epam.aidial.evaluation.query.service.QueryDslRunnableTestCaseSelector;
+import com.epam.aidial.evaluation.runner.config.logging.LogExecution;
+import com.epam.aidial.evaluation.runner.dto.PageResponseDto;
+import com.epam.aidial.evaluation.runner.dto.RunConfigDto;
+import com.epam.aidial.evaluation.runner.dto.TestSuiteRunResponseDto;
+import com.epam.aidial.evaluation.runner.model.TestCaseRunResult;
+import com.epam.aidial.evaluation.runner.model.target.McpToolTarget;
+import com.epam.aidial.evaluation.runner.util.AuthorizationTokenHolder;
+import com.epam.aidial.evaluation.runner.util.CallerCredential;
+import com.epam.aidial.evaluation.service.domain.analytics.EvalResultsCsvParser;
+import com.epam.aidial.evaluation.service.domain.analytics.EvalResultsImportService;
+import com.epam.aidial.evaluation.service.domain.analytics.RunDeletionService;
+import com.epam.aidial.evaluation.service.domain.dto.RunErrorCategory;
+import com.epam.aidial.evaluation.service.domain.dto.page.PageResponseMapper;
+import com.epam.aidial.evaluation.service.domain.exception.DatasetVisibilityErrorCode;
+import com.epam.aidial.evaluation.service.domain.exception.DatasetVisibilityRuleException;
+import com.epam.aidial.evaluation.service.domain.exception.EntityNotFoundException;
+import com.epam.aidial.evaluation.service.domain.exception.InvalidOperationException;
+import com.epam.aidial.evaluation.service.domain.exception.TooManyRunsException;
+import com.epam.aidial.evaluation.service.domain.exception.UniqueConstraintViolationDetector;
+import com.epam.aidial.evaluation.service.domain.exception.ValidationException;
+import com.epam.aidial.evaluation.service.domain.filter.FilterParser;
+import com.epam.aidial.evaluation.service.domain.job.ActiveRunRegistry;
+import com.epam.aidial.evaluation.service.domain.job.ExecutionSettingsValidator;
+import com.epam.aidial.evaluation.service.domain.job.TestSuiteEvaluationJob;
+import com.epam.aidial.evaluation.service.domain.mapper.TestSuiteRunMapper;
+import com.epam.aidial.evaluation.service.domain.sort.SortParser;
+import com.epam.aidial.evaluation.utils.CorrelationIdContext;
+import io.opentelemetry.context.Context;
+import java.io.InputStream;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.RejectedExecutionException;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
+
+@Slf4j
+@Service
+@LogExecution
+@RequiredArgsConstructor
+public class TestSuiteRunService {
+
+    private final TestSuiteRunRepository testSuiteRunRepository;
+    private final TestSuiteRepository testSuiteRepository;
+    private final TestCaseService testCaseService;
+    private final SuiteTargetResolver suiteTargetResolver;
+    private final QueryDslRunnableTestCaseSelector runnableTestCaseSelector;
+    private final TestSuiteRunProperties properties;
+    private final TestSuiteEvaluationJob evaluationJob;
+    private final ActiveRunRegistry registry;
+    private final ExecutionSettingsValidator executionSettingsValidator;
+    private final TestSuiteRunSseService sseService;
+    private final TestSuiteRunMapper mapper;
+    private final FilterParser filterParser;
+    private final SortParser sortParser;
+    private final ObjectMapper objectMapper;
+    private final EvalResultsImportService evalResultsImportService;
+    private final EvalResultsCsvParser evalResultsCsvParser;
+    private final Optional<DialRouteTriggerClient> dialRouteTriggerClient;
+    private final Optional<DialAppProperties> dialAppProperties;
+    private final RunDeletionService runDeletionService;
+
+    @Qualifier("metaTransactionManager")
+    private final PlatformTransactionManager metaTransactionManager;
+
+    @Transactional("metaTransactionManager")
+    public TestSuiteRunResponseDto createRun(UUID testSuiteId, RunConfigDto config) {
+        TestSuite testSuite = testSuiteRepository
+                .findById(testSuiteId)
+                .orElseThrow(() -> new EntityNotFoundException("TestSuite not found with id: " + testSuiteId));
+
+        // Unbound-suite guard fires BEFORE the valid=false check so the dataset-binding failure
+        // mode is reported even when the suite would also fail validation.
+        if (testSuite.getDatasetId() == null) {
+            throw new DatasetVisibilityRuleException(
+                    DatasetVisibilityErrorCode.SUITE_HAS_NO_DATASET,
+                    "Cannot start a run: test suite " + testSuiteId
+                            + " is not bound to a dataset (datasetId is null).");
+        }
+
+        if (!testSuite.isValid()) {
+            throw new InvalidOperationException("Cannot create a run for test suite with id: " + testSuiteId
+                    + ". The test suite is not in a valid state.");
+        }
+
+        // Multi-turn test cases are supported for any HTTP suite shape (DEPLOYMENT or ROUTE). Reject an MCP suite
+        // whose dataset contains any multi-turn case (409 INVALID_OPERATION).
+        if (suiteTargetResolver.fromEntity(testSuite) instanceof McpToolTarget
+                && testCaseService.datasetHasMultiTurnCases(testSuite.getDatasetId())) {
+            throw new InvalidOperationException("Cannot create a run: MCP suites do not support multi-turn test cases");
+        }
+
+        long numberOfTestCases =
+                runnableTestCaseSelector.countRunnable(testSuite.getDatasetId(), testSuite.getTestCaseFilter());
+        if (numberOfTestCases == 0) {
+            throw new InvalidOperationException("Suite has no valid and enabled test cases");
+        }
+
+        int maxRuns = properties.getRunConfig().getMaxNumberOfRuns();
+        if (config.getNumberOfRuns() > maxRuns) {
+            throw new ValidationException("numberOfRuns must not exceed " + maxRuns);
+        }
+
+        executionSettingsValidator.validate(config.getExecution(), config.getRetry());
+
+        enforceConcurrencyLimits(testSuiteId);
+
+        String runConfigJson;
+        try {
+            runConfigJson = objectMapper.writeValueAsString(config);
+        } catch (JacksonException ex) {
+            throw new IllegalStateException("Failed to serialize runConfig", ex);
+        }
+
+        TestSuiteRun run =
+                createAndSaveRun(testSuiteId, config.getTestRunName(), (int) numberOfTestCases, runConfigJson);
+
+        UUID runId = run.getId();
+        CallerCredential credential = AuthorizationTokenHolder.getCredential();
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                dispatchEvaluation(runId, credential, false, () -> {
+                    String errorDetails = evaluationJob.buildErrorDetails(
+                            "EXECUTOR_REJECTED",
+                            RunErrorCategory.RESOURCE_LIMIT,
+                            "The execution queue is full. Please try again later.",
+                            null);
+                    testSuiteRunRepository.updateToFailed(
+                            runId,
+                            "Executor rejected job submission",
+                            errorDetails,
+                            System.currentTimeMillis(),
+                            System.currentTimeMillis());
+                });
+            }
+        });
+
+        return mapper.toDto(run);
+    }
+
+    /**
+     * Imports a batch of already-produced eval results for an existing, dataset-bound suite: parses the
+     * uploaded CSV via {@link EvalResultsCsvParser}, creates a {@code PENDING} run, then — once
+     * this transaction commits — persists the results (analytics datasource) and triggers Phase 2 (metric
+     * evaluation) + Phase 3 (score computation) asynchronously via
+     * {@link TestSuiteEvaluationJob#dispatch} with Phase 1 skipped. Dispatch is deferred to
+     * {@code afterCommit} for the same reason {@link #createRun} defers it: the async job reads the run by
+     * id on its own connection and must not race a not-yet-visible row.
+     */
+    @Transactional("metaTransactionManager")
+    public TestSuiteRunResponseDto importResultsAndEvaluate(
+            UUID testSuiteId, String testRunName, InputStream csv, long contentLength, char delimiter) {
+        TestSuite testSuite = testSuiteRepository
+                .findById(testSuiteId)
+                .orElseThrow(() -> new EntityNotFoundException("TestSuite not found with id: " + testSuiteId));
+
+        if (testSuite.getDatasetId() == null) {
+            throw new DatasetVisibilityRuleException(
+                    DatasetVisibilityErrorCode.SUITE_HAS_NO_DATASET,
+                    "Cannot import eval results: test suite " + testSuiteId
+                            + " is not bound to a dataset (datasetId is null).");
+        }
+
+        if (!testSuite.isValid()) {
+            throw new InvalidOperationException("Cannot import eval results for test suite with id: " + testSuiteId
+                    + ". The test suite is not in a valid state.");
+        }
+
+        List<TestCaseRunResult> results =
+                evalResultsCsvParser.parse(testSuite.getDatasetId(), csv, contentLength, delimiter);
+        evalResultsImportService.validateBatch(results);
+
+        enforceConcurrencyLimits(testSuiteId);
+
+        TestSuiteRun run = createAndSaveRun(testSuiteId, testRunName, results.size(), "{}");
+
+        UUID runId = run.getId();
+
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                try {
+                    evalResultsImportService.persistResults(testSuiteId, run, results);
+                } catch (Exception ex) {
+                    log.error("Failed to persist imported eval results for run {}: {}", runId, ex.getMessage(), ex);
+                    markRunFailed(runId, "Failed to persist imported eval results", "IMPORT_RESULTS_PERSIST_FAILED");
+                    return;
+                }
+
+                dispatchEvaluation(
+                        runId,
+                        null,
+                        true,
+                        () -> markRunFailed(runId, "Executor rejected job submission", "EXECUTOR_REJECTED"));
+            }
+        });
+
+        return mapper.toDto(run);
+    }
+
+    /**
+     * Applies the global and per-suite concurrent-run limits shared, byte-identical, by
+     * {@link #createRun} and {@link #importResultsAndEvaluate}.
+     */
+    private void enforceConcurrencyLimits(UUID testSuiteId) {
+        List<String> activeStatuses = RunStatus.activeStatusNames();
+
+        int globalActive = testSuiteRunRepository.countByStatuses(activeStatuses);
+        if (globalActive >= properties.getLimits().getMaxConcurrentRunsGlobal()) {
+            throw new TooManyRunsException(
+                    "Global concurrent run limit reached",
+                    Map.of(
+                            "activeRunsGlobal",
+                            globalActive,
+                            "maxRunsGlobal",
+                            properties.getLimits().getMaxConcurrentRunsGlobal()));
+        }
+
+        int suiteActive = testSuiteRunRepository.countByTestSuiteIdAndStatuses(testSuiteId, activeStatuses);
+        if (suiteActive >= properties.getLimits().getMaxConcurrentRunsPerSuite()) {
+            throw new TooManyRunsException(
+                    "Suite concurrent run limit reached",
+                    Map.of(
+                            "activeRunsForSuite",
+                            suiteActive,
+                            "maxRunsPerSuite",
+                            properties.getLimits().getMaxConcurrentRunsPerSuite()));
+        }
+    }
+
+    /**
+     * Saves a new {@code PENDING} {@link TestSuiteRun}, resolving {@code requestedTestRunName} to a
+     * generated {@code "Run #<seq>"} name when blank, and mapping a run-name unique-constraint
+     * violation to {@link com.epam.aidial.evaluation.service.domain.exception.UniqueConstraintViolationException}.
+     * Shared, byte-identical modulo {@code runConfigJson}, by {@link #createRun} (its serialized
+     * {@link RunConfigDto}) and {@link #importResultsAndEvaluate} (a fixed {@code "{}"}).
+     */
+    private TestSuiteRun createAndSaveRun(
+            UUID testSuiteId, String requestedTestRunName, int numberOfTestCases, String runConfigJson) {
+        String testRunName = requestedTestRunName;
+        if (testRunName == null || testRunName.isBlank()) {
+            long seqVal = testSuiteRunRepository.nextRunNameSequenceValue();
+            testRunName = "Run #" + seqVal;
+        }
+
+        TestSuiteRun run = TestSuiteRun.builder()
+                .testSuiteId(testSuiteId)
+                .testRunName(testRunName)
+                .status(RunStatus.PENDING.name())
+                .runConfig(runConfigJson)
+                .numberOfTestCases(numberOfTestCases)
+                .build();
+
+        try {
+            testSuiteRunRepository.save(run);
+        } catch (DataIntegrityViolationException ex) {
+            UniqueConstraintViolationDetector.rethrowIfUniqueViolation(
+                    ex,
+                    "A test suite run with name '" + testRunName + "' already exists for this test suite",
+                    testRunName);
+            throw ex;
+        }
+
+        return run;
+    }
+
+    /**
+     * Marks an import run {@code FAILED} and notifies SSE listeners. Uses {@code System.currentTimeMillis()}
+     * directly rather than an injected {@code Clock}, consistent with {@link #createRun}'s own pre-existing
+     * timestamp handling in this failure path (see {@code design.md} Decision 6). Used only by
+     * {@link #importResultsAndEvaluate}'s {@code afterCommit} callback.
+     */
+    private void markRunFailed(UUID runId, String errorMessage, String errorCode) {
+        long now = System.currentTimeMillis();
+        String errorDetails = evaluationJob.buildErrorDetails(errorCode, RunErrorCategory.INTERNAL, errorMessage, null);
+        testSuiteRunRepository.updateToFailed(runId, errorMessage, errorDetails, now, now);
+        testSuiteRunRepository.findById(runId).ifPresent(sseService::notifyStatusUpdate);
+    }
+
+    /**
+     * Dispatches Phase 1–3 (or Phase 2/3 only, when {@code skipDeploymentPhase} is {@code true}) via
+     * {@link TestSuiteEvaluationJob#dispatch}. If the executor rejects the submission, invokes
+     * {@code onRejected} so each caller can apply its own failure-compensation logic.
+     *
+     * <p>When `dial-app-proxy.enabled=true` and a caller JWT is available (the {@link #createRun} path),
+     * dispatches via DIAL Core's Application Route by calling {@link DialRouteTriggerClient#triggerEvalRun}
+     * on a virtual thread. {@link #importResultsAndEvaluate} calls this with {@code credential == null} (it
+     * has no caller JWT to trigger a DIAL Core route with) — DIAL App mode has no PRK-issuing leg for that
+     * flow, so it deliberately falls back to the existing direct, in-process
+     * {@link TestSuiteEvaluationJob#dispatch} path instead of attempting a trigger call with a null
+     * credential (which would NPE inside {@link DialRouteTriggerClient}). This preserves
+     * {@code importResultsAndEvaluate}'s existing behavior unchanged regardless of the flag.
+     */
+    private void dispatchEvaluation(
+            UUID runId, CallerCredential credential, boolean skipDeploymentPhase, Runnable onRejected) {
+        if (dialAppProperties.isPresent()
+                && dialAppProperties.get().isEnabled()
+                && dialRouteTriggerClient.isPresent()
+                && credential != null) {
+            log.info("Dispatching eval via DIAL App mode (route trigger): runId={}", runId);
+            final Context traceContext = Context.current();
+            Thread.startVirtualThread(traceContext.wrap(CorrelationIdContext.wrap(() -> {
+                try {
+                    dialRouteTriggerClient.get().triggerEvalRun(runId, credential);
+                } catch (DialRouteTriggerException ex) {
+                    log.warn(
+                            "DIAL App mode route trigger failed for run {}; marking run FAILED: {}",
+                            runId,
+                            ex.getMessage(),
+                            ex);
+                    markRunFailed(
+                            runId, "Failed to trigger evaluation via DIAL Core route", "DIAL_APP_ROUTE_TRIGGER_FAILED");
+                }
+            })));
+        } else {
+            try {
+                evaluationJob.dispatch(runId, credential, skipDeploymentPhase);
+            } catch (RejectedExecutionException ex) {
+                log.warn("Executor rejected job submission for run {}: {}", runId, ex.getMessage(), ex);
+                onRejected.run();
+            }
+        }
+    }
+
+    @Transactional(value = "metaTransactionManager", readOnly = true)
+    public TestSuiteRunResponseDto getRun(UUID runId) {
+        TestSuiteRun run = testSuiteRunRepository
+                .findById(runId)
+                .orElseThrow(() -> new EntityNotFoundException("TestSuiteRun not found with id: " + runId));
+        return mapper.toDto(run);
+    }
+
+    /**
+     * Verifies the run exists, scoping the meta-DB transaction to just this lookup so the caller's
+     * subsequent external HTTP calls (to dial-adas) do not hold a pooled meta-DB connection open.
+     * Package-private: also called by {@link CostService#getRunCosts(UUID)}, which depends on this
+     * service rather than {@link TestSuiteRunRepository} directly to reach the run-existence check.
+     */
+    void ensureRunExists(UUID runId) {
+        TransactionTemplate txTemplate = new TransactionTemplate(metaTransactionManager);
+        txTemplate.setReadOnly(true);
+        txTemplate.executeWithoutResult(status -> testSuiteRunRepository
+                .findById(runId)
+                .orElseThrow(() -> new EntityNotFoundException("TestSuiteRun not found with id: " + runId)));
+    }
+
+    @Transactional(value = "metaTransactionManager", readOnly = true)
+    public TestSuiteRunResponseDto getLatestRun(UUID suiteId) {
+        TestSuiteRun run = testSuiteRunRepository
+                .findLatestByTestSuiteId(suiteId)
+                .orElseThrow(() -> new EntityNotFoundException("No runs found for test suite with id: " + suiteId));
+        return mapper.toDto(run);
+    }
+
+    @Transactional(value = "metaTransactionManager", readOnly = true)
+    public PageResponseDto<TestSuiteRunResponseDto> listRuns(
+            int page, int size, List<String> sort, List<String> filter, Boolean includeTotalCount) {
+        PageRequest pageRequest = PageRequest.builder()
+                .page(page)
+                .size(size)
+                .sort(sortParser.parse(sort != null ? sort : List.of()))
+                .build();
+        List<FilterCondition> filters = filterParser.parse(filter != null ? filter : List.of());
+        boolean includeTotal = Boolean.TRUE.equals(includeTotalCount);
+
+        Page<TestSuiteRun> runPage = testSuiteRunRepository.findAll(pageRequest, filters, includeTotal);
+        return PageResponseMapper.from(runPage, mapper::toDto, includeTotal);
+    }
+
+    @Transactional("metaTransactionManager")
+    public TestSuiteRunResponseDto cancelRun(UUID runId) {
+        return cancelRun(runId, findRunOrThrow(runId));
+    }
+
+    /**
+     * Design D5 cancel state machine. Terminal statuses are rejected (409); PENDING attempts an
+     * optimistic CAS straight to CANCELLED; CANCELLING is an idempotent no-op returning the current
+     * state; RUNNING attempts {@link TestSuiteRunRepository#markCancelling}. Either optimistic write can
+     * lose a race to a concurrent transition — in that case the row is re-read and this method recurses
+     * on the fresh status. A run's status only ever advances
+     * (PENDING -&gt; RUNNING -&gt; CANCELLING -&gt; terminal), so the recursion is bounded.
+     */
+    private TestSuiteRunResponseDto cancelRun(UUID runId, TestSuiteRun run) {
+        String status = run.getStatus();
+
+        if (RunStatus.isTerminal(status)) {
+            throw new InvalidOperationException("Cannot cancel run with status: " + status);
+        }
+
+        if (status.equals(RunStatus.PENDING.name())) {
+            int updated = testSuiteRunRepository.updateStatusOptimistic(
+                    runId, RunStatus.CANCELLED.name(), RunStatus.PENDING.name());
+            if (updated == 0) {
+                return cancelRun(runId, findRunOrThrow(runId));
+            }
+            TestSuiteRun cancelled = findRunOrThrow(runId);
+            afterCommit(() -> registry.cancel(runId));
+            sseService.notifyStatusUpdate(cancelled);
+            return mapper.toDto(cancelled);
+        }
+
+        if (status.equals(RunStatus.CANCELLING.name())) {
+            return mapper.toDto(run);
+        }
+
+        // RUNNING
+        if (testSuiteRunRepository.markCancelling(runId) == 0) {
+            return cancelRun(runId, findRunOrThrow(runId));
+        }
+
+        TestSuiteRun cancelling = findRunOrThrow(runId);
+        afterCommit(() -> registry.cancel(runId));
+        sseService.notifyStatusUpdate(cancelling);
+        return mapper.toDto(cancelling);
+    }
+
+    private TestSuiteRun findRunOrThrow(UUID runId) {
+        return testSuiteRunRepository
+                .findById(runId)
+                .orElseThrow(() -> new EntityNotFoundException("TestSuiteRun not found with id: " + runId));
+    }
+
+    /**
+     * Registers {@code action} to run once the current transaction commits, via the same
+     * {@link TransactionSynchronization} idiom {@link #createRun} and {@link #importResultsAndEvaluate}
+     * use for their post-commit dispatch: a rolled-back cancel must not leave a dead run executor behind
+     * a still-{@code RUNNING} row.
+     */
+    private void afterCommit(Runnable action) {
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                action.run();
+            }
+        });
+    }
+
+    @Transactional("metaTransactionManager")
+    public void deleteRun(UUID runId) {
+        TestSuiteRun run = testSuiteRunRepository
+                .findById(runId)
+                .orElseThrow(() -> new EntityNotFoundException("TestSuiteRun not found with id: " + runId));
+
+        if (!RunStatus.isTerminal(run.getStatus())) {
+            String reason = run.getStatus().equals(RunStatus.CANCELLING.name())
+                    ? "The run is still being cancelled."
+                    : "Cancel it first.";
+            throw new InvalidOperationException(
+                    "Cannot delete a test suite run with status " + run.getStatus() + ". " + reason);
+        }
+
+        // Write analytics tombstone before meta deletion so the read paths immediately exclude this run
+        runDeletionService.markDeleted(runId);
+        testSuiteRunRepository.deleteById(runId);
+    }
+
+    /**
+     * Marks all runs owned by a suite as deleted in the analytics database.
+     * Used during suite deletion to ensure analytics data is excluded from reads
+     * before the meta-level cascade delete removes the run rows.
+     *
+     * @param testSuiteId the suite whose runs should be tombstoned
+     */
+    public void tombstoneAllRunsForSuite(UUID testSuiteId) {
+        List<UUID> runIds = testSuiteRunRepository.findIdsByTestSuiteId(testSuiteId);
+        runDeletionService.markDeleted(runIds);
+        if (!runIds.isEmpty()) {
+            log.debug("Tombstoned {} runs for suite {}", runIds.size(), testSuiteId);
+        }
+    }
+
+    @Transactional("metaTransactionManager")
+    public TestSuiteRunResponseDto updateRunName(UUID runId, String newName) {
+        testSuiteRunRepository
+                .findById(runId)
+                .orElseThrow(() -> new EntityNotFoundException("TestSuiteRun not found with id: " + runId));
+
+        try {
+            testSuiteRunRepository.updateTestRunName(runId, newName);
+        } catch (DataIntegrityViolationException ex) {
+            UniqueConstraintViolationDetector.rethrowIfUniqueViolation(
+                    ex, "A test suite run with name '" + newName + "' already exists for this test suite", newName);
+            throw ex;
+        }
+
+        return mapper.toDto(testSuiteRunRepository.findById(runId).orElseThrow());
+    }
+}

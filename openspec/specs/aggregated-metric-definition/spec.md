@@ -1,0 +1,96 @@
+# Aggregated Metric Definitions
+
+## Purpose
+Describe the suite-scoped read endpoints that enrich metric definitions with declaration and version details, and their current response contract.
+
+## Requirements
+
+### Requirement: Aggregated metric definition endpoint
+The system SHALL provide a `GET /api/v1/test-suites/{testSuiteId}/metric-definitions/{id}/aggregated` endpoint that returns a test suite metric definition enriched with its referenced metric declaration and metric declaration version in a single response.
+
+Status: Implemented
+
+#### Scenario: Successful retrieval of aggregated metric definition
+- **WHEN** a client sends `GET /api/v1/test-suites/{testSuiteId}/metric-definitions/{id}/aggregated` with valid `testSuiteId` and `id`
+- **THEN** the system SHALL return HTTP 200 with a response containing:
+  - Top-level metric definition fields: `id`, `testSuiteId`, `name`, `configBindings`, `inputBindings`, `createdAt`, `updatedAt`
+  - Nested `metricDeclaration` object: `id`, `providerId`, `name`, `description`, `createdAt`
+  - Nested `metricDeclarationVersion` object: `id`, `metricDeclarationId`, `schemaVersion`, `configSchema` (as JSON object), `inputSchema` (as JSON object), `outputSchema` (as JSON object), `description`, `createdAt`
+
+#### Scenario: Metric definition not found
+- **WHEN** a client sends `GET /api/v1/test-suites/{testSuiteId}/metric-definitions/{id}/aggregated` with a non-existent metric definition `id`
+- **THEN** the system SHALL return HTTP 404 with error code `NOT_FOUND`
+
+#### Scenario: Metric definition belongs to a different test suite
+- **WHEN** a client sends `GET /api/v1/test-suites/{testSuiteId}/metric-definitions/{id}/aggregated` where the metric definition exists but belongs to a different test suite
+- **THEN** the system SHALL return HTTP 404 with error code `NOT_FOUND`
+
+#### Scenario: Test suite does not exist
+- **WHEN** a client sends `GET /api/v1/test-suites/{testSuiteId}/metric-definitions/{id}/aggregated` with a non-existent `testSuiteId`
+- **THEN** the system SHALL return HTTP 404 with error code `NOT_FOUND`
+
+### Requirement: Suite-wide aggregated metric definition list
+The system SHALL provide `GET /api/v1/test-suites/{testSuiteId}/metric-definitions/aggregated`, returning HTTP 200 with an unpaginated JSON array of aggregated metric definitions for the requested test suite.
+
+Status: Implemented
+
+#### Scenario: List aggregated definitions
+- **WHEN** a client requests the aggregated metric-definition list for a suite with metric definitions
+- **THEN** the response SHALL contain each definition enriched with its metric declaration and metric declaration version, including descriptions and JSON-object schemas
+
+#### Scenario: Include management definitions
+- **WHEN** a suite contains disabled or invalid metric definitions
+- **THEN** the aggregated list SHALL include them
+
+#### Scenario: Isolate definitions by suite
+- **WHEN** metric definitions exist in another test suite
+- **THEN** they SHALL not appear in the requested suite's aggregated list
+
+#### Scenario: No aggregated definitions
+- **WHEN** a client requests the aggregated list for a suite with no metric definitions or for an unknown suite ID
+- **THEN** the system SHALL return HTTP 200 with an empty array
+
+### Requirement: OpenAPI documentation for aggregated metric definition list
+The aggregated metric-definition list endpoint SHALL document its array response and provide minimal and full response examples.
+
+Status: Implemented
+
+#### Scenario: List endpoint is documented
+- **WHEN** a developer views the OpenAPI document
+- **THEN** the aggregated list operation SHALL expose an array schema for aggregated metric definitions and minimal and full examples.
+### Requirement: Aggregated response fields
+The aggregated response DTO SHALL expose `id`, `testSuiteId`, `name`, `metricDeclarationName`, `metricDeclarationId`, `metricDeclarationVersionId`, `configBindings`, `inputBindings`, `createdAt`, `updatedAt`, `metricDeclaration`, and `metricDeclarationVersion`. It SHALL NOT expose the standard management response's `enabled`, `condition`, `valid`, or `validationWarnings` fields; it is an enriched projection, not a superset of that response.
+
+Status: Implemented
+
+#### Scenario: Enriched projection rather than management superset
+- **WHEN** a client retrieves an aggregated metric definition
+- **THEN** the response SHALL contain the listed enrichment fields but not `enabled`, `condition`, `valid`, or `validationWarnings`
+
+### Requirement: JSONB schema fields exposed as JSON objects
+The `configSchema`, `inputSchema`, and `outputSchema` fields in the nested `metricDeclarationVersion` object SHALL be returned as JSON objects (not raw strings), consistent with the existing `MetricDeclarationVersionResponseDto` convention.
+
+Status: Implemented
+
+#### Scenario: Schema fields are proper JSON objects
+- **WHEN** a client retrieves an aggregated metric definition where the referenced version has non-null schemas
+- **THEN** `metricDeclarationVersion.configSchema`, `metricDeclarationVersion.inputSchema`, and `metricDeclarationVersion.outputSchema` SHALL each be a JSON object (Map), not a JSON string
+
+#### Scenario: Null schema fields
+- **WHEN** a client retrieves an aggregated metric definition where the referenced version has null schemas
+- **THEN** the corresponding schema fields SHALL be omitted by the configured non-null JSON serialization
+
+### Requirement: OpenAPI documentation for aggregated endpoint
+The aggregated endpoint SHALL have OpenAPI annotations including operation summary, description, response schema, and example responses.
+
+Status: Implemented
+
+#### Scenario: Endpoint visible in Swagger UI
+- **WHEN** a developer opens Swagger UI
+- **THEN** the `GET /{id}/aggregated` endpoint SHALL appear under the "Test Suite Metric Definitions" tag with a clear description of its purpose
+
+## Implementation Notes
+
+- [Controller](../../../src/main/java/com/epam/aidial/evaluation/web/controller/TestSuiteMetricDefinitionController.java) registers both aggregated reads and their OpenAPI schemas.
+- [Service](../../../src/main/java/com/epam/aidial/evaluation/service/domain/TestSuiteMetricDefinitionService.java) delegates suite-scoped lookup/list to the repository without a separate suite-existence check.
+- [Aggregated DTO](../../../src/main/java/com/epam/aidial/evaluation/service/domain/dto/AggregatedMetricDefinitionResponseDto.java) and [mapper](../../../src/main/java/com/epam/aidial/evaluation/service/domain/mapper/TestSuiteMetricDefinitionMapper.java) define the projection; [version DTO](../../../src/main/java/com/epam/aidial/evaluation/service/domain/dto/MetricDeclarationVersionResponseDto.java) exposes object schemas.

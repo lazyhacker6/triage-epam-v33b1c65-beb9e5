@@ -1,0 +1,57 @@
+{
+  "$type": "dial-application",
+  "deploymentId": "applications/public/Quick App with RAG__0.0.1",
+  "displayName": "Quick App with RAG",
+  "version": "0.0.1",
+  "description": "Resolved by ID alone via DIAL Core's unified deployment-lookup endpoint, which identified the type as an application.",
+  "owner": "organization-owner",
+  "reference": "applications/public/Quick App with RAG__0.0.1",
+  "createdAt": 1769192823293,
+  "updatedAt": 1769194293867,
+  "descriptionKeywords": [],
+  "inputAttachmentTypes": null,
+  "features": {
+    "rate": false,
+    "tokenize": false,
+    "truncate_prompt": false,
+    "configuration": true,
+    "system_prompt": false,
+    "tools": false,
+    "seed": false,
+    "url_attachments": true,
+    "folder_attachments": false,
+    "allow_resume": true,
+    "accessible_by_per_request_key": true,
+    "content_parts": false,
+    "temperature": false,
+    "addons": false
+  },
+  "applicationTypeSchemaId": "https://dial-quick-apps.example.com/",
+  "applicationProperties": {},
+  "interfaces": ["chat"],
+  "routes": {
+    "v1": {
+      "name": "v1",
+      "userRoles": null,
+      "response": null,
+      "rewritePath": true,
+      "paths": ["/v1/.*"],
+      "methods": ["GET", "POST"],
+      "upstreams": [
+        {
+          "endpoint": "http://my-endpoint.svc.cluster.local",
+          "extraData": null,
+          "weight": 1,
+          "tier": 0
+        }
+      ],
+      "maxRetryAttempts": 1,
+      "order": 2147483647,
+      "permissions": [],
+      "attachmentPaths": {
+        "requestBody": [],
+        "responseBody": []
+      }
+    }
+  }
+}

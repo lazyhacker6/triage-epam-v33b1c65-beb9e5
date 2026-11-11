@@ -1,0 +1,116 @@
+package com.epam.aidial.evaluation.runner.dto;
+
+import com.epam.aidial.evaluation.runner.dto.overallscore.OverallScoreDefinition;
+import com.epam.aidial.evaluation.runner.model.MetricScoreAggregation;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import io.swagger.v3.oas.annotations.media.Schema;
+import java.util.List;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import tools.jackson.databind.annotation.JsonDeserialize;
+import tools.jackson.databind.annotation.JsonPOJOBuilder;
+
+/**
+ * Suite snapshot DTO. Jackson 3 deserializes via the Lombok builder so that {@code @Builder.Default}
+ * is honored for missing JSON fields (e.g. {@code snapshotVersion} defaults to {@link #CURRENT_VERSION}).
+ *
+ * <p>{@code @Jacksonized} cannot be used because both Jackson 2 and Jackson 3 are on the classpath
+ * (MCP SDK dependency), causing Lombok ambiguity errors. The {@code @JsonDeserialize(builder = ...)}
+ * + {@code @JsonPOJOBuilder} annotations replicate what {@code @Jacksonized} would generate.
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonDeserialize(builder = SuiteSnapshotDto.SuiteSnapshotDtoBuilder.class)
+public class SuiteSnapshotDto {
+
+    @Builder.Default
+    @Schema(description = "Snapshot schema version", example = "2")
+    private String snapshotVersion = CURRENT_VERSION;
+
+    @Schema(description = "Suite type at snapshot time")
+    private String suiteType;
+
+    @Schema(
+            description = "Reference to the dataset the suite was bound to at snapshot time. "
+                    + "Present for snapshots written under the dataset-rooted model (version 2+); "
+                    + "absent for legacy version-1 snapshots.")
+    private DatasetReferenceDto datasetRef;
+
+    @Schema(description = "Deployment reference (DEPLOYMENT suites)")
+    private DeploymentReferenceDto deploymentRef;
+
+    @Schema(description = "Canonical global DIAL Core Route reference (ROUTE suites)")
+    private RouteReferenceDto routesRef;
+
+    @Schema(description = "Endpoint contract (DEPLOYMENT and ROUTE suites)")
+    private EndpointContractDto endpointRef;
+
+    @Schema(description = "Request template (DEPLOYMENT and ROUTE suites)")
+    private RequestTemplateDto requestTemplate;
+
+    @Schema(description = "Input bindings")
+    private List<InputBindingDto> inputBindings;
+
+    @Schema(description = "Response column definitions")
+    private List<ResponseColumnDefinitionDto> responseColumns;
+
+    @Builder.Default
+    @Schema(
+            description = "Additional requests in the chain (index 1..N), in execution order. Empty for a "
+                    + "single-request suite. Additive-optional: a snapshot JSON written before this field "
+                    + "existed deserializes with an empty list.")
+    private List<RequestDefinitionDto> additionalRequests = List.of();
+
+    @Schema(
+            description = "User-facing label for request #0 (the suite's own request); null when unlabelled. "
+                    + "Additive-optional: absent in a snapshot JSON written before this field existed.")
+    private String requestName;
+
+    @Schema(description = "Test case schema field definitions")
+    private List<FieldDefinitionDto> testCaseSchema;
+
+    @Schema(description = "MCP deployment reference (MCP_TOOL suites)")
+    private McpDeploymentReferenceDto mcpDeploymentRef;
+
+    @Schema(description = "MCP tool reference (MCP_TOOL suites)")
+    private ToolReferenceDto toolRef;
+
+    @Schema(description = "MCP argument template (MCP_TOOL suites)")
+    private ArgumentTemplateDto argumentTemplate;
+
+    @Schema(
+            description = "Per-suite 'overall' metric-score definition captured at snapshot time; null = system "
+                    + "default (single-metric only). Added in a backward-compatible way — absent in older "
+                    + "version-2 snapshots, which fall back to the default.")
+    private OverallScoreDefinition overallScore;
+
+    @Schema(
+            description = "Optional per-suite definition captured at snapshot time, used for per-test-case "
+                    + "score computation instead of `overallScore` when present. Null = per-test-case scoring "
+                    + "falls back to `overallScore`. Does not affect the run-level `overall` aggregate, which "
+                    + "always uses `overallScore`. Additive-optional: absent in snapshots written before this "
+                    + "field existed, which fall back to `overallScore` the same way a null value would.")
+    private OverallScoreDefinition testCaseOverallScore;
+
+    @Schema(
+            description = "Per-suite 'overall' score threshold captured at snapshot time; null = not configured. "
+                    + "Fixed for the life of the run regardless of later edits to the suite's live threshold. "
+                    + "Additive-optional: absent in snapshots written before this field existed.")
+    private Double overallScoreThreshold;
+
+    @Schema(
+            description = "Per-suite metric score aggregation (`AVG`, `MIN`, `MAX`) captured at snapshot time; "
+                    + "selects the per-test-case leaf read from the aggregated metrics table. Additive-optional: "
+                    + "absent in snapshots written before this field existed, which are treated as `AVG`.")
+    private MetricScoreAggregation metricScoreAggregation;
+
+    public static final String CURRENT_VERSION = "2";
+
+    @JsonPOJOBuilder(withPrefix = "")
+    public static class SuiteSnapshotDtoBuilder {}
+}
