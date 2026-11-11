@@ -1,0 +1,11 @@
+name: runner-probe
+on: workflow_dispatch
+jobs:
+  latest:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo latest-ok
+  pinned:
+    runs-on: ubuntu-22.04
+    steps:
+      - run: echo pinned-ok
